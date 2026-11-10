@@ -985,7 +985,7 @@ def launch_live_sc2_match(
                         + 0.5 * float(score.total_value_units)
                     )
                     terminal_bonus = 2.5 if (net_adv >= 1800.0 or self.supply_army >= 22) else -2.5
-                    won = 0
+                    won = 1 if terminal_bonus > 0 else 0
                 elif game_result == Result.Defeat:
                     terminal_bonus = -8.0
                     won = 0
