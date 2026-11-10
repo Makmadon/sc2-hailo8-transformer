@@ -83,44 +83,6 @@ LOCAL_BACKUP_ROLLOUT_PATH = os.path.join(
     "models",
     "sc2_rl_rollouts.npz",
 )
-LIVE_RL_LOG_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "models",
-    "rl_live_progress.log",
-)
-
-
-class _TeeLogger:
-    def __init__(self, orig_stream, log_path: str):
-        self.orig = orig_stream
-        self.log_path = log_path
-
-    def write(self, data: str):
-        try:
-            self.orig.write(data)
-            self.orig.flush()
-        except Exception:
-            pass
-        try:
-            with open(self.log_path, "a", encoding="utf-8") as lf:
-                lf.write(data)
-        except Exception:
-            pass
-
-    def flush(self):
-        try:
-            self.orig.flush()
-        except Exception:
-            pass
-
-
-def _enable_live_rl_log(reset: bool = False):
-    os.makedirs(os.path.dirname(LIVE_RL_LOG_PATH), exist_ok=True)
-    if reset:
-        with open(LIVE_RL_LOG_PATH, "w", encoding="utf-8") as lf:
-            lf.write("")
-    if not isinstance(sys.stdout, _TeeLogger):
-        sys.stdout = _TeeLogger(sys.stdout, LIVE_RL_LOG_PATH)
 
 
 def append_rl_rollout_to_drive(
@@ -255,6 +217,32 @@ def launch_live_sc2_match(
             self.prev_army_val: float = 0.0
             self.prev_workers: float = 12.0
             self.prev_bases: int = 1
+            # Estructuras aliadas destruidas (acumuladas entre chunks vía on_unit_destroyed)
+            self.pending_lost_structure_value: float = 0.0
+            self.pending_lost_townhalls: int = 0
+            self.cancelled_structure_tags: set = set()
+            # Celdas 16x16 ya recorridas por el ejército en esta partida (bonus de exploración count-based)
+            self.army_visited_cells = np.zeros((GRID_H, GRID_W), dtype=bool)
+
+        async def on_unit_destroyed(self, unit_tag: int):
+            """Registra el valor (minerales + gas) de cada estructura aliada destruida por el enemigo."""
+            lost = self._structures_previous_map.get(unit_tag)
+            if lost is None or unit_tag in self.cancelled_structure_tags:
+                return
+            try:
+                val = self.calculate_unit_value(lost.type_id)
+                value = float(val.minerals + val.vespene)
+            except Exception:
+                value = 100.0
+            # Las estructuras en construcción solo pierden la fracción invertida
+            value *= max(0.25, float(getattr(lost, "build_progress", 1.0)))
+            self.pending_lost_structure_value += value
+            if lost.type_id in (
+                UnitTypeId.COMMANDCENTER, UnitTypeId.ORBITALCOMMAND, UnitTypeId.PLANETARYFORTRESS,
+                UnitTypeId.COMMANDCENTERFLYING, UnitTypeId.ORBITALCOMMANDFLYING,
+                UnitTypeId.NEXUS, UnitTypeId.HATCHERY, UnitTypeId.LAIR, UnitTypeId.HIVE,
+            ):
+                self.pending_lost_townhalls += 1
 
         async def on_start(self):
             self.client.game_step = 8 if (collect_rl and not realtime) else 4
@@ -267,21 +255,13 @@ def launch_live_sc2_match(
 
         def build_obs_tensor(self) -> np.ndarray:
             """
-            Construye el tensor [1, 12, 16, 16] alineado exactamente con la distribución espacial
-            y económica de SC2-Dynamics-50K usada durante el entrenamiento del .hef.
+            Construye el tensor [1, 12, 16, 16] con los valores reales de la partida
+            (misma codificación de canales que SC2-Dynamics-50K, sin señales sintéticas).
             """
             tensor = np.zeros((1, IN_CHANNELS, GRID_H, GRID_W), dtype=np.float32)
 
-            # En SC2-Dynamics-50K los jugadores profesionales nunca acumulan >180 minerales con pocos trabajadores;
-            # mantener la señal en el rango en-distribución evita covariate shift hacia HARVEST_GATHER_MINERALS.
-            raw_minerals = float(self.minerals)
-            if self.supply_workers < 22 and raw_minerals > 180.0:
-                eff_minerals = 65.0 + (raw_minerals % 115.0)
-            else:
-                eff_minerals = raw_minerals
-
-            # Canales 6..11: Estado económico, suministro, raza y progreso temporal
-            tensor[0, 6, :, :] = np.clip(eff_minerals / 2000.0, 0.0, 1.0)
+            # Canales 6..11: Estado económico, suministro, raza y progreso temporal (valores reales, sin reescalados ficticios)
+            tensor[0, 6, :, :] = np.clip(float(self.minerals) / 2000.0, 0.0, 1.0)
             tensor[0, 7, :, :] = np.clip(float(self.vespene) / 1500.0, 0.0, 1.0)
             tensor[0, 8, :, :] = np.clip(float(self.supply_used) / 200.0, 0.0, 1.0)
             tensor[0, 9, :, :] = np.clip(float(self.supply_army) / 120.0, 0.0, 1.0)
@@ -289,10 +269,8 @@ def launch_live_sc2_match(
 
             self_race_id = RACES.get(self.race.name, 0)
             enemy_race_id = RACES.get(self.enemy_race.name, 0)
-            eff_time = max(25.0, float(self.time)) if self.supply_workers < 16 else float(self.time)
-            eff_rate = max(float(self.state.score.collection_rate_minerals), float(self.supply_workers) * 45.0)
-            tensor[0, 11, 0:4, :] = np.clip(eff_time / 1200.0, 0.0, 1.0)
-            tensor[0, 11, 4:8, :] = np.clip(eff_rate / 2500.0, 0.0, 1.0)
+            tensor[0, 11, 0:4, :] = np.clip(float(self.time) / 1200.0, 0.0, 1.0)
+            tensor[0, 11, 4:8, :] = np.clip(float(self.state.score.collection_rate_minerals) / 2500.0, 0.0, 1.0)
             tensor[0, 11, 8:12, :] = (self_race_id + 1) / 3.0
             tensor[0, 11, 12:16, :] = (enemy_race_id + 1) / 3.0
 
@@ -305,35 +283,23 @@ def launch_live_sc2_match(
                 gy = int(np.clip((float(pos.y) / map_h) * GRID_H, 0, GRID_H - 1))
                 return gx, gy
 
-            # Canal 0 y 1: Unidades propias agrupadas (densidad 0.25 por grupo espacial, igual que SC2-Dynamics-50K)
-            unit_groups = [(6, 7), (7, 7), (8, 15), (10, 6), (11, 7)]
-            for uy, ux in unit_groups:
-                tensor[0, 0, uy, ux] = 0.25
-                tensor[0, 1, uy, ux] = 1.0
+            # Canal 0 y 1: Densidad real y HP promedio de todas las unidades propias en la malla 16x16
+            for u in self.units:
+                gx, gy = to_training_grid(u.position)
+                weight = 0.08 if u.type_id in (UnitTypeId.SCV, UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.MULE) else 0.20
+                tensor[0, 0, gy, gx] = min(1.0, tensor[0, 0, gy, gx] + weight)
+                tensor[0, 1, gy, gx] = float(u.health_percentage)
 
-            combat_units = self.units.exclude_type([UnitTypeId.SCV, UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.MULE])
-            seen_types = set()
-            for u in combat_units:
-                if u.type_id not in seen_types:
-                    seen_types.add(u.type_id)
-                    gx, gy = to_training_grid(u.position)
-                    tensor[0, 0, gy, gx] = min(1.0, tensor[0, 0, gy, gx] + 0.25)
-                    tensor[0, 1, gy, gx] = float(u.health_percentage)
-
-            # Canal 2 y 5: Estructuras propias y cola de producción
+            # Canal 2 y 5: Estructuras propias reales y cola de producción
             active_orders = 0
-            tensor[0, 2, 5, 6] = 0.5
-            tensor[0, 2, 8, 6] = 0.5
-            tensor[0, 2, 8, 7] = 0.5
             for s in self.structures:
                 gx, gy = to_training_grid(s.position)
-                tensor[0, 2, gy, gx] = min(1.0, max(tensor[0, 2, gy, gx], 0.5))
+                tensor[0, 2, gy, gx] = min(1.0, tensor[0, 2, gy, gx] + 0.5)
                 active_orders += len(s.orders)
 
-            eff_orders = max(active_orders, min(6, max(1, int(self.structures.amount))))
-            tensor[0, 5, :, :] = np.clip(eff_orders / 10.0, 0.0, 1.0)
+            tensor[0, 5, :, :] = np.clip(active_orders / 10.0, 0.0, 1.0)
 
-            # Canal 3 y 4: Unidades y estructuras enemigas visibles
+            # Canal 3 y 4: Unidades y estructuras enemigas visibles reales en el mapa
             for eu in self.enemy_units + self.enemy_structures:
                 gx, gy = to_training_grid(eu.position)
                 tensor[0, 3, gy, gx] = min(1.0, tensor[0, 3, gy, gx] + 0.25)
@@ -384,9 +350,6 @@ def launch_live_sc2_match(
 
             # [03] TRAIN_WORKER (SCV / Probe / Drone)
             elif act_name == "TRAIN_WORKER":
-                if self.supply_left <= 1 and self.supply_cap < 200 and not self.already_pending(UnitTypeId.SUPPLYDEPOT):
-                    if self.race == Race.Terran and self.can_afford(UnitTypeId.SUPPLYDEPOT):
-                        await self.build(UnitTypeId.SUPPLYDEPOT, near=self.resolve_build_location(gx, gy, 6.0))
                 for th in self.townhalls.ready:
                     if len(th.orders) < 2:
                         if self.race == Race.Terran and self.can_afford(UnitTypeId.SCV):
@@ -444,10 +407,6 @@ def launch_live_sc2_match(
             elif act_name == "BUILD_BARRACKS_GATEWAY_POOL":
                 loc = self.resolve_build_location(gx, gy, distance_from_base=8.5)
                 if self.race == Race.Terran:
-                    if not self.structures([UnitTypeId.SUPPLYDEPOT, UnitTypeId.SUPPLYDEPOTLOWERED]).ready and not self.already_pending(UnitTypeId.SUPPLYDEPOT):
-                        if self.can_afford(UnitTypeId.SUPPLYDEPOT):
-                            await self.build(UnitTypeId.SUPPLYDEPOT, near=self.resolve_build_location(gx, gy, 6.0))
-                            return
                     if self.can_afford(UnitTypeId.BARRACKS):
                         await self.build(UnitTypeId.BARRACKS, near=loc)
                 elif self.race == Race.Protoss and self.can_afford(UnitTypeId.GATEWAY):
@@ -499,15 +458,6 @@ def launch_live_sc2_match(
             elif act_name == "BUILD_DEFENSE_STRUCTURE":
                 loc = self.resolve_build_location(gx, gy, distance_from_base=9.5)
                 if self.race == Race.Terran:
-                    # En SC2 un Bunker requiere Supply Depot + Barracks previos en el árbol tecnológico
-                    if not self.structures([UnitTypeId.SUPPLYDEPOT, UnitTypeId.SUPPLYDEPOTLOWERED]).ready and not self.already_pending(UnitTypeId.SUPPLYDEPOT):
-                        if self.can_afford(UnitTypeId.SUPPLYDEPOT):
-                            await self.build(UnitTypeId.SUPPLYDEPOT, near=self.resolve_build_location(gx, gy, 6.0))
-                            return
-                    if not self.structures(UnitTypeId.BARRACKS).ready and not self.already_pending(UnitTypeId.BARRACKS):
-                        if self.can_afford(UnitTypeId.BARRACKS):
-                            await self.build(UnitTypeId.BARRACKS, near=self.resolve_build_location(gx, gy, 8.5))
-                            return
                     if self.structures(UnitTypeId.BUNKER).amount < 2 and self.can_afford(UnitTypeId.BUNKER):
                         await self.build(UnitTypeId.BUNKER, near=loc)
                     elif self.can_afford(UnitTypeId.MISSILETURRET):
@@ -538,10 +488,6 @@ def launch_live_sc2_match(
                     for rax in self.structures(UnitTypeId.BARRACKS).ready:
                         if getattr(rax, "has_techlab", False) and len(rax.orders) < 2 and self.can_afford(UnitTypeId.MARAUDER):
                             rax.train(UnitTypeId.MARAUDER)
-                            return
-                    for rax in self.structures(UnitTypeId.BARRACKS).ready.idle:
-                        if not rax.has_add_on and self.can_afford(UnitTypeId.BARRACKSTECHLAB):
-                            rax.build(UnitTypeId.BARRACKSTECHLAB)
                             return
                 elif self.race == Race.Protoss:
                     for gw in self.structures(UnitTypeId.GATEWAY).ready:
@@ -575,9 +521,6 @@ def launch_live_sc2_match(
                     for fac in self.structures(UnitTypeId.FACTORY).ready:
                         if getattr(fac, "has_techlab", False) and len(fac.orders) < 2 and self.can_afford(UnitTypeId.SIEGETANK):
                             fac.train(UnitTypeId.SIEGETANK)
-                            return
-                        elif not fac.has_add_on and len(fac.orders) == 0 and self.can_afford(UnitTypeId.FACTORYTECHLAB):
-                            fac.build(UnitTypeId.FACTORYTECHLAB)
                             return
                         elif len(fac.orders) < 2 and self.can_afford(UnitTypeId.HELLION):
                             fac.train(UnitTypeId.HELLION)
@@ -625,9 +568,6 @@ def launch_live_sc2_match(
             # [18] RESEARCH_WEAPONS_ARMOR (Engineering Bay +1/+2/+3 Infantry Weapons & Armor)
             elif act_name == "RESEARCH_WEAPONS_ARMOR":
                 if self.race == Race.Terran:
-                    if not self.structures(UnitTypeId.ENGINEERINGBAY) and not self.already_pending(UnitTypeId.ENGINEERINGBAY):
-                        if self.can_afford(UnitTypeId.ENGINEERINGBAY):
-                            await self.build(UnitTypeId.ENGINEERINGBAY, near=self.resolve_build_location(gx, gy, 7.5))
                     for eb in self.structures(UnitTypeId.ENGINEERINGBAY).ready.idle:
                         for upg in (
                             UpgradeId.TERRANINFANTRYWEAPONSLEVEL1,
@@ -762,16 +702,22 @@ def launch_live_sc2_match(
             elif act_name == "CANCEL_OR_HOLD_POSITION":
                 for s in self.structures.not_ready:
                     if s.health_percentage < 0.20:
+                        self.cancelled_structure_tags.add(s.tag)
                         s(AbilityId.CANCEL_BUILDINPROGRESS)
                         return
                 for u in army.closer_than(10.0, target_pt):
                     u.hold_position(queue=queue)
 
-        def apply_rl_exploration(self, chunks: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        def apply_rl_exploration(
+            self,
+            chunks: List[Dict[str, object]],
+            obs_tensor: Optional[np.ndarray] = None,
+        ) -> List[Dict[str, object]]:
             """
             Exploración táctica (ε-greedy) durante --collect-rl:
             Con probabilidad explore_eps muestrea acciones y celdas (gx, gy) en la malla 16x16
-            del mapa completo para que la red descubra por refuerzo dónde construir, expandir y atacar.
+            guiándose únicamente por los canales del propio tensor de observación (Canal 3 = enemigos
+            visibles, Canal 0 = celdas aún no ocupadas por unidades aliadas) para evitar ruido de entrenamiento.
             """
             if not collect_rl or explore_eps <= 0.0:
                 return chunks
@@ -791,12 +737,22 @@ def launch_live_sc2_match(
             def rand_map_cell() -> Tuple[int, int]:
                 return int(self.rng.integers(0, GRID_W)), int(self.rng.integers(0, GRID_H))
 
+            def sample_combat_cell() -> Tuple[int, int]:
+                if obs_tensor is not None:
+                    enemy_yx = np.argwhere(obs_tensor[0, 3] > 0.0)
+                    if len(enemy_yx) > 0 and self.rng.random() < 0.70:
+                        idx = int(self.rng.integers(0, len(enemy_yx)))
+                        return int(enemy_yx[idx][1]), int(enemy_yx[idx][0])
+                    unvisited_yx = np.argwhere(~self.army_visited_cells)
+                    if len(unvisited_yx) > 0:
+                        idx = int(self.rng.integers(0, len(unvisited_yx)))
+                        return int(unvisited_yx[idx][1]), int(unvisited_yx[idx][0])
+                return rand_map_cell()
+
             candidate_actions: List[Tuple[str, int, int]] = []
             # Candidatos económicos y de suministro
             if self.supply_left <= 3 and self.supply_cap < 200 and self.minerals >= 100:
                 candidate_actions.append(("BUILD_SUPPLY", *near_base_cell()))
-            if self.structures(UnitTypeId.SUPPLYDEPOT).ready:
-                candidate_actions.append(("MICRO_SIEGE_TRANSFORM", bgx, bgy))
             if self.supply_workers < min(66, self.townhalls.amount * 22):
                 candidate_actions.append(("TRAIN_WORKER", bgx, bgy))
             if self.minerals >= 400 and self.townhalls.amount < 3:
@@ -825,13 +781,16 @@ def launch_live_sc2_match(
             if self.structures(UnitTypeId.STARPORT).ready:
                 candidate_actions.append(("TRAIN_AIR_UNIT", bgx, bgy))
 
-            # Candidatos de combate y micro (muestreando celdas (gx, gy) de toda la malla 16x16)
+            # Candidatos de combate y micro (muestreando celdas con enemigos visibles en Canal 3 o zonas no exploradas)
             if self.supply_army >= 12:
-                rx, ry = rand_map_cell()
-                candidate_actions.append(("ATTACK_MOVE_COORDINATE", rx, ry))
-                candidate_actions.append(("FOCUS_FIRE_TARGET", rx, ry))
-                candidate_actions.append(("MICRO_USE_STIM_ABILITY", rx, ry))
-                candidate_actions.append(("MICRO_SIEGE_TRANSFORM", rx, ry))
+                cx, cy = sample_combat_cell()
+                candidate_actions.append(("ATTACK_MOVE_COORDINATE", cx, cy))
+                candidate_actions.append(("FOCUS_FIRE_TARGET", cx, cy))
+                # Habilidades sin destino espacial: solo se exploran cuando existen las unidades que las usan
+                if self.enemy_units and self.units([UnitTypeId.MARINE, UnitTypeId.MARAUDER]):
+                    candidate_actions.append(("MICRO_USE_STIM_ABILITY", cx, cy))
+                if self.units([UnitTypeId.SIEGETANK, UnitTypeId.SIEGETANKSIEGED]):
+                    candidate_actions.append(("MICRO_SIEGE_TRANSFORM", cx, cy))
             if self.enemy_units and self.townhalls and self.enemy_units.closer_than(25.0, self.townhalls.first):
                 candidate_actions.append(("DEFEND_MAIN_NATURAL", bgx, bgy))
 
@@ -857,8 +816,13 @@ def launch_live_sc2_match(
         def compute_chunk_reward(self) -> float:
             """
             Calcula la recompensa densa r_t del último Action-Chunk ejecutado:
-            Premia destruir unidades/estructuras enemigas, crecer economía/ejército y expandir bases;
-            penaliza bloqueos de suministro y acumulación ociosa de minerales.
+            - Premia destruir unidades/estructuras enemigas, crecer economía/ejército y expandir bases.
+            - Penaliza perder estructuras propias (simétrico al premio por destruir estructuras enemigas)
+              y perder centros de mando / bases (simétrico al premio por expandir).
+            - Premia alinear las coordenadas de ataque (gx, gy) con celdas donde el Canal 3 muestra enemigos visibles.
+            - Premia (una sola vez por celda) llevar el ejército a celdas nunca recorridas cuando no hay enemigos visibles.
+            - Penaliza ignorar enemigos visibles en el Canal 3, quedarse estancado atacando una celda vacía donde ya
+              está el propio ejército, los bloqueos de suministro y la acumulación ociosa de minerales.
             """
             score = self.state.score
             killed_val = float(score.killed_value_units) + 1.5 * float(score.killed_value_structures)
@@ -882,10 +846,66 @@ def launch_live_sc2_match(
                 + (0.15 * d_workers)
                 + (0.80 * max(0, d_bases))
             )
+
+            # Penalización por estructuras aliadas destruidas (misma escala que el premio por estructuras enemigas)
+            if self.pending_lost_structure_value > 0.0:
+                r -= 1.5 * self.pending_lost_structure_value / 200.0
+                r -= 0.80 * self.pending_lost_townhalls
+                self.pending_lost_structure_value = 0.0
+                self.pending_lost_townhalls = 0
+
             if self.supply_left <= 0 and self.supply_cap < 200 and self.minerals >= 100:
                 r -= 0.15
             if self.minerals > 600 and self.supply_used < 185:
                 r -= 0.10
+
+            # Evaluación espacial de la atención (Canal 3 = enemigos visibles, Canal 0 = unidades propias)
+            if self.rl_states and self.rl_actions:
+                last_state = self.rl_states[-1]
+                last_chunk = self.rl_actions[-1]
+                enemy_map = last_state[3]
+                ally_map = last_state[0]
+                has_visible_enemies = bool(np.any(enemy_map > 0.0))
+
+                spatial_delta = 0.0
+                for k in range(len(last_chunk)):
+                    act_id = int(last_chunk[k, 0])
+                    gx = int(np.clip(last_chunk[k, 1], 0, GRID_W - 1))
+                    gy = int(np.clip(last_chunk[k, 2], 0, GRID_H - 1))
+
+                    if act_id in (22, 23, 28, 29):  # Acciones ofensivas / combate
+                        y0, y1 = max(0, gy - 1), min(GRID_H, gy + 2)
+                        x0, x1 = max(0, gx - 1), min(GRID_W, gx + 2)
+                        local_enemy = float(np.max(enemy_map[y0:y1, x0:x1]))
+                        if has_visible_enemies:
+                            if local_enemy > 0.0:
+                                spatial_delta = max(spatial_delta, 0.30)
+                            elif act_id in (22, 23) and spatial_delta == 0.0:
+                                spatial_delta = min(spatial_delta, -0.25)
+                        else:
+                            # Sin enemigos visibles: penalizar quedarse atacando la celda vacía donde ya está nuestro ejército
+                            if ally_map[gy, gx] >= 0.20:
+                                spatial_delta = min(spatial_delta, -0.20)
+                            elif self.supply_army >= 10 and not self.army_visited_cells[gy, gx]:
+                                spatial_delta = max(spatial_delta, 0.12)
+                    elif (
+                        act_id == 20
+                        and not has_visible_enemies
+                        and self.supply_army >= 10
+                        and not self.army_visited_cells[gy, gx]
+                    ):
+                        spatial_delta = max(spatial_delta, 0.12)
+
+                r += spatial_delta
+
+            # Actualizar el mapa de celdas recorridas por el ejército (solo unidades de combate)
+            map_w = max(1.0, float(self.game_info.map_size.width))
+            map_h = max(1.0, float(self.game_info.map_size.height))
+            for u in self.units.exclude_type([UnitTypeId.SCV, UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.MULE, UnitTypeId.OVERLORD]):
+                vx = int(np.clip((float(u.position.x) / map_w) * GRID_W, 0, GRID_W - 1))
+                vy = int(np.clip((float(u.position.y) / map_h) * GRID_H, 0, GRID_H - 1))
+                self.army_visited_cells[vy, vx] = True
+
             return float(np.clip(r, -2.5, 2.5))
 
         async def on_step(self, iteration: int):
@@ -906,7 +926,7 @@ def launch_live_sc2_match(
                 self.last_rtt_ms = (time.perf_counter() - t0) * 1000.0
                 self.last_npu_ms = float(resp.get("latency_ms", 0.0))
                 raw_chunks = list(resp.get("chunks", []))
-                self.chunk_queue = self.apply_rl_exploration(raw_chunks)
+                self.chunk_queue = self.apply_rl_exploration(raw_chunks, obs_tensor=obs_tensor)
                 self.total_inferences += 1
 
                 if collect_rl and len(self.chunk_queue) == ACTION_CHUNK_SIZE:
@@ -1010,37 +1030,6 @@ def launch_live_sc2_match(
             if self.lan_client is not None:
                 self.lan_client.close()
 
-    import sc2.sc2process as sc2_proc_mod
-    orig_connect = sc2_proc_mod.SC2Process._connect
-
-    async def fast_fail_connect(self):
-        if self._process is not None and self._process.poll() is not None:
-            raise RuntimeError(f"SC2_x64.exe se cerró al iniciar (código {self._process.poll()}).")
-        # Verificar cada segundo que SC2_x64.exe no haya abortado por DirectX (ej. pantalla bloqueada/apagada)
-        import aiohttp
-        for i in range(60):
-            if self._process is None:
-                sys.exit()
-            rc = self._process.poll()
-            if rc is not None:
-                print(
-                    f"⚠️ [DirectX / SC2_x64.exe] El cliente gráfico de StarCraft II se cerró con código {rc} "
-                    f"(0x{rc & 0xFFFFFFFF:08X}). Asegúrate de que la sesión de Windows esté desbloqueada y con pantalla activa.",
-                    flush=True,
-                )
-                raise RuntimeError(f"SC2_x64.exe terminó prematuramente con código {rc}")
-            await asyncio.sleep(1)
-            try:
-                self._session = aiohttp.ClientSession()
-                ws = await self._session.ws_connect(self.ws_url, timeout=120)
-                return ws
-            except aiohttp.ClientConnectorError:
-                if self._session is not None:
-                    await self._session.close()
-        raise TimeoutError("Websocket connection to SC2 process timed out")
-
-    sc2_proc_mod.SC2Process._connect = fast_fail_connect
-
     if human_vs_ai:
         import sc2.main as sc2_main
         orig_sc2_proc = sc2_main.SC2Process
@@ -1125,7 +1114,6 @@ def run_rl_collection_loop(
     - Si el porcentaje de victorias alcanza >= 60%, sube automáticamente la dificultad
       (Easy -> Medium -> Hard -> VeryHard).
     """
-    _enable_live_rl_log(reset=True)
     _disable_windows_quickedit()
     _cleanup_orphan_sc2()
     time.sleep(1.0)
@@ -1280,7 +1268,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.single_rl_ep:
-        _enable_live_rl_log(reset=False)
         res = launch_live_sc2_match(
             rpi_ip=args.rpi_ip,
             port=args.port,
