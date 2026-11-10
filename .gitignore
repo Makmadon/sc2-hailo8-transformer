@@ -1,0 +1,20 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Archivos temporales y logs locales
+*.log
+*.tmp
+models/rl_live_progress.log
+models/sc2_rl_rollouts.npz
+models/*.har
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db

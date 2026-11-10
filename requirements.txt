@@ -1,0 +1,7 @@
+torch>=2.1.0
+numpy>=1.24.0
+huggingface_hub>=0.20.0
+onnx>=1.15.0
+onnxruntime>=1.17.0
+pysc2>=4.0.0
+matplotlib>=3.7.0
