@@ -79,6 +79,7 @@ class Hailo8InferenceEngine:
         self.backend = "none"
         self.hef_path = hef_path
         self.onnx_path = onnx_path
+        self._persistent_pipeline = False
 
         try:
             from hailo_platform import (
@@ -102,32 +103,114 @@ class Hailo8InferenceEngine:
             self.output_vstreams_params = OutputVStreamParams.make(self.network_group, format_type=FormatType.FLOAT32)
             self.input_name = self.hef.get_input_vstream_infos()[0].name
             self.backend = "hailo8"
-            print(f"[Hailo-8 HAT] Binario HEF cargado exitosamente en NPU PCIe: {hef_path}")
-        except Exception as e:
-            print(f"[Aviso] hailo_platform no disponible o sin HAT físico ({e}). Usando ONNX Runtime de respaldo...")
-            import onnxruntime as ort
 
-            self.ort_session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-            self.backend = "onnxruntime"
-            print(f"[ONNX Runtime] Modelo cargado exitosamente: {onnx_path}")
+            self._start_persistent_hailo()
+            print(f"[Hailo-8 HAT] Pipeline persistente activado exitosamente en NPU PCIe: {hef_path}")
+        except Exception as e:
+            print(f"[Aviso] hailo_platform no disponible o sin HAT físico ({e}). Intentando ONNX Runtime...")
+            try:
+                import onnxruntime as ort
+                self.ort_session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+                self.backend = "onnxruntime"
+                print(f"[ONNX Runtime] Modelo cargado exitosamente: {onnx_path}")
+            except Exception as ort_err:
+                print(f"[Aviso] ONNX Runtime no instalado en este dispositivo ({ort_err}).")
+
+    def _start_persistent_hailo(self):
+        try:
+            from hailo_platform import InferVStreams
+            self.activation_ctx = self.network_group.activate(self.network_group_params)
+            self.activation = self.activation_ctx.__enter__()
+            self.pipeline_ctx = InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params)
+            self.pipeline = self.pipeline_ctx.__enter__()
+            self._persistent_pipeline = True
+        except Exception as exc:
+            print(f"[Hailo-8 Aviso] Modo persistente no soportado ({exc}), usando activación por frame.")
+            self._persistent_pipeline = False
 
     def infer(self, obs_nchw: np.ndarray) -> List[Dict[str, object]]:
         if self.backend == "hailo8":
-            from hailo_platform import InferVStreams
-
-            # Hailo espera entrada NHWC [1, 16, 16, 12]
             obs_nhwc = np.transpose(obs_nchw, (0, 2, 3, 1)).astype(np.float32)
-            with InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params) as pipeline:
-                with self.network_group.activate(self.network_group_params):
-                    results = pipeline.infer({self.input_name: obs_nhwc})
+            try:
+                if self._persistent_pipeline:
+                    results = self.pipeline.infer({self.input_name: obs_nhwc})
                     raw_out = list(results.values())[0]
+                else:
+                    from hailo_platform import InferVStreams
+                    with InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params) as pipe:
+                        with self.network_group.activate(self.network_group_params):
+                            results = pipe.infer({self.input_name: obs_nhwc})
+                            raw_out = list(results.values())[0]
+            except Exception as e:
+                print(f"[Hailo-8 Error] Fallo en inferencia ({e}). Reintentando con reinicio de pipeline...")
+                self._start_persistent_hailo()
+                if self._persistent_pipeline:
+                    results = self.pipeline.infer({self.input_name: obs_nhwc})
+                    raw_out = list(results.values())[0]
+                else:
+                    raise e
         else:
             raw_out = self.ort_session.run(None, {"obs_tensor": obs_nchw.astype(np.float32)})[0]
 
         return decode_action_chunks(raw_out)
 
 
-def run_server(host: str = "0.0.0.0", port: int = 5555, hef_path: str = "sc2_hailo8_agent.hef", onnx_path: str = "sc2_hailo8_transformer.onnx"):
+def handle_client(
+    conn: socket.socket,
+    addr: tuple,
+    engine: Hailo8InferenceEngine,
+    expected_bytes: int,
+):
+    """Maneja la conexión persistente TCP de un cliente de StarCraft II de forma secuencial y directa."""
+    with conn:
+        print(f"[RPi Servidor] Cliente PC conectado desde {addr}")
+        while True:
+            buf = b""
+            try:
+                while len(buf) < expected_bytes:
+                    packet = conn.recv(expected_bytes - len(buf))
+                    if not packet:
+                        break
+                    buf += packet
+                if len(buf) < expected_bytes:
+                    print(f"[RPi Servidor] Conexión cerrada normalmente por {addr}.")
+                    break
+
+                t0 = time.perf_counter()
+                obs_tensor = np.frombuffer(buf, dtype=np.float32).reshape(1, IN_CHANNELS, GRID_H, GRID_W)
+                actions = engine.infer(obs_tensor)
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+
+                payload = json.dumps({
+                    "latency_ms": round(latency_ms, 3),
+                    "backend": engine.backend,
+                    "chunks": actions,
+                }).encode("utf-8")
+                conn.sendall(struct.pack("!I", len(payload)) + payload)
+            except Exception as exc:
+                print(f"[RPi Servidor] Error atendiendo cliente {addr}: {exc}")
+                try:
+                    fallback_chunks = [
+                        {"step": k, "action_id": 0, "action_name": "NO_OP", "target_grid": [8, 8], "target_sc2_coord": [32, 32], "queue": False}
+                        for k in range(ACTION_CHUNK_SIZE)
+                    ]
+                    err_payload = json.dumps({
+                        "latency_ms": 0.0,
+                        "backend": "server_fallback",
+                        "chunks": fallback_chunks,
+                    }).encode("utf-8")
+                    conn.sendall(struct.pack("!I", len(err_payload)) + err_payload)
+                except Exception:
+                    pass
+                break
+
+
+def run_server(
+    host: str = "0.0.0.0",
+    port: int = 5555,
+    hef_path: str = "sc2_hailo8_agent.hef",
+    onnx_path: str = "sc2_hailo8_transformer.onnx",
+):
     engine = Hailo8InferenceEngine(hef_path=hef_path, onnx_path=onnx_path)
     expected_bytes = 1 * IN_CHANNELS * GRID_H * GRID_W * 4  # 12 * 16 * 16 * 4 = 12,288 bytes por frame
 
@@ -135,31 +218,12 @@ def run_server(host: str = "0.0.0.0", port: int = 5555, hef_path: str = "sc2_hai
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((host, port))
         srv.listen(1)
-        print(f"[RPi Servidor] Escuchando observaciones de StarCraft II en {host}:{port} (Backend: {engine.backend})...")
+        print(f"[RPi Servidor Dedicado] Escuchando en {host}:{port} (Backend: {engine.backend})...")
 
         while True:
             conn, addr = srv.accept()
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            print(f"[RPi Servidor] Cliente PC conectado desde {addr}")
-            with conn:
-                while True:
-                    buf = b""
-                    while len(buf) < expected_bytes:
-                        packet = conn.recv(expected_bytes - len(buf))
-                        if not packet:
-                            break
-                        buf += packet
-                    if len(buf) < expected_bytes:
-                        print("[RPi Servidor] Conexión cerrada por el cliente PC.")
-                        break
-
-                    t0 = time.perf_counter()
-                    obs_tensor = np.frombuffer(buf, dtype=np.float32).reshape(1, IN_CHANNELS, GRID_H, GRID_W)
-                    actions = engine.infer(obs_tensor)
-                    latency_ms = (time.perf_counter() - t0) * 1000.0
-
-                    payload = json.dumps({"latency_ms": round(latency_ms, 3), "backend": engine.backend, "chunks": actions}).encode("utf-8")
-                    conn.sendall(struct.pack("!I", len(payload)) + payload)
+            handle_client(conn, addr, engine, expected_bytes)
 
 
 if __name__ == "__main__":

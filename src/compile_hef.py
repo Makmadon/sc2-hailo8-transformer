@@ -7,31 +7,59 @@ Resuelve los errores comunes de compilación en Colab:
      cuando el parser de Hailo así lo requiere.
 """
 
+import argparse
 import os
 import numpy as np
 
 # En contenedores de Google Colab la variable de entorno USER no está definida por defecto,
 # y el compilador backend de Hailo (runner.compile()) la requiere para crear directorios temporales.
-os.environ.setdefault("USER", "colab")
-os.environ.setdefault("LOGNAME", "colab")
-os.environ.setdefault("HOME", "/root")
+os.environ.setdefault("USER", "colab" if os.path.exists("/content") else os.environ.get("USER", "user"))
+os.environ.setdefault("LOGNAME", os.environ.get("USER", "user"))
+if os.path.exists("/content"):
+    os.environ.setdefault("HOME", "/root")
+
+
+def get_default_paths() -> dict:
+    if os.path.exists("/content/drive/MyDrive/hailo_files"):
+        base = "/content/drive/MyDrive/hailo_files"
+    else:
+        # En WSL / local usar el directorio models del repositorio
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.abspath(os.path.join(script_dir, ".."))
+        base = os.path.join(repo_root, "models")
+
+    return {
+        "onnx": os.path.join(base, "sc2_hailo8_transformer.onnx"),
+        "calib": os.path.join(base, "sc2_calib_data.npy"),
+        "hef": os.path.join(base, "sc2_hailo8_agent.hef"),
+        "har": os.path.join(base, "sc2_hailo8_quantized.har"),
+    }
 
 
 def compile_onnx_to_hef(
-    onnx_path: str = "/content/drive/MyDrive/hailo_files/sc2_hailo8_transformer.onnx",
-    calib_path: str = "/content/drive/MyDrive/hailo_files/sc2_calib_data.npy",
-    hef_output_path: str = "/content/drive/MyDrive/hailo_files/sc2_hailo8_agent.hef",
-    har_output_path: str = "/content/drive/MyDrive/hailo_files/sc2_hailo8_quantized.har",
+    onnx_path: str = None,
+    calib_path: str = None,
+    hef_output_path: str = None,
+    har_output_path: str = None,
+    force_quant: bool = False,
 ):
+    defaults = get_default_paths()
+    onnx_path = onnx_path or defaults["onnx"]
+    calib_path = calib_path or defaults["calib"]
+    hef_output_path = hef_output_path or defaults["hef"]
+    har_output_path = har_output_path or defaults["har"]
+
     from hailo_sdk_client import ClientRunner
 
     print("=== Iniciando Compilación para Hailo-8 (26 TOPS INT8) ===")
     runner = ClientRunner(hw_arch="hailo8")
 
-    if os.path.exists(har_output_path):
+    if not force_quant and os.path.exists(har_output_path):
         print(f"[Hailo DFC] Encontrado HAR ya cuantizado, cargando directamente: {har_output_path}")
         runner.load_har(har_output_path)
     else:
+        if not os.path.exists(onnx_path):
+            raise FileNotFoundError(f"No se encontró el modelo ONNX en: {onnx_path}")
         # 1. Traducir el grafo ONNX estático
         hn, npz = runner.translate_onnx_model(
             onnx_path,
@@ -83,4 +111,18 @@ def compile_onnx_to_hef(
 
 
 if __name__ == "__main__":
-    compile_onnx_to_hef()
+    parser = argparse.ArgumentParser(description="Compilador Hailo DFC ONNX -> HEF para Hailo-8")
+    parser.add_argument("--onnx", type=str, default=None, help="Ruta al modelo ONNX")
+    parser.add_argument("--calib", type=str, default=None, help="Ruta al archivo .npy de calibración")
+    parser.add_argument("--hef", type=str, default=None, help="Ruta de salida del archivo .hef")
+    parser.add_argument("--har", type=str, default=None, help="Ruta del archivo .har cuantizado intermedio")
+    parser.add_argument("--force-quant", action="store_true", help="Forzar re-cuantización incluso si existe el .har")
+    args = parser.parse_args()
+
+    compile_onnx_to_hef(
+        onnx_path=args.onnx,
+        calib_path=args.calib,
+        hef_output_path=args.hef,
+        har_output_path=args.har,
+        force_quant=args.force_quant,
+    )

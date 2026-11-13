@@ -25,25 +25,57 @@ from .config import ACTION_CHUNK_SIZE, ACTION_TO_ID, GRID_H, GRID_W, ID_TO_ACTIO
 
 
 class SC2HailoLANClient:
-    """Cliente TCP de baja latencia (TCP_NODELAY) hacia la Raspberry Pi + Hailo-8."""
+    """Cliente TCP de baja latencia (TCP_NODELAY) hacia la Raspberry Pi + Hailo-8 con auto-reconexión."""
 
-    def __init__(self, rpi_ip: str = "192.168.50.7", port: int = 5555):
+    def __init__(self, rpi_ip: str = "192.168.50.7", port: int = 5555, timeout: float = 15.0):
         self.rpi_ip = rpi_ip
         self.port = port
+        self.timeout = timeout
+        self.sock: Optional[socket.socket] = None
+        self._connect()
+
+    def _connect(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        self.sock.settimeout(5.0)
+        self.sock.settimeout(self.timeout)
         self.sock.connect((self.rpi_ip, self.port))
         print(f"[PC Cliente SC2] Conectado al cerebro Raspberry Pi + Hailo-8 en {self.rpi_ip}:{self.port}")
 
     def request_action_chunk(self, obs_tensor: np.ndarray) -> Dict[str, object]:
         assert obs_tensor.shape == (1, IN_CHANNELS, GRID_H, GRID_W)
-        self.sock.sendall(obs_tensor.astype(np.float32).tobytes())
+        payload_bytes = obs_tensor.astype(np.float32).tobytes()
 
-        header = self._recv_exact(4)
-        msg_len = struct.unpack("!I", header)[0]
-        body = self._recv_exact(msg_len)
-        return json.loads(body.decode("utf-8"))
+        for attempt in range(2):
+            try:
+                if self.sock is None:
+                    self._connect()
+                self.sock.sendall(payload_bytes)
+                header = self._recv_exact(4)
+                msg_len = struct.unpack("!I", header)[0]
+                body = self._recv_exact(msg_len)
+                return json.loads(body.decode("utf-8"))
+            except (socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
+                print(f"⚠️ [LAN Retry] Latencia o desconexión transitoria ({exc}). Reintentando conexión con RPi ({attempt+1}/2)...")
+                try:
+                    self._connect()
+                except Exception:
+                    time.sleep(0.5)
+
+        # Fallback de emergencia si la RPi no responde tras reintentos (evita que SC2 aborte la partida)
+        print("⚠️ [LAN Fallback] RPi temporalmente inaccesible. Usando acción segura NO_OP...")
+        return {
+            "latency_ms": 0.0,
+            "backend": "client_fallback",
+            "chunks": [
+                {"step": k, "action_id": 0, "action_name": "NO_OP", "target_grid": [8, 8], "target_sc2_coord": [32, 32], "queue": False}
+                for k in range(ACTION_CHUNK_SIZE)
+            ],
+        }
 
     def _recv_exact(self, n: int) -> bytes:
         buf = b""
@@ -56,7 +88,8 @@ class SC2HailoLANClient:
 
     def close(self):
         try:
-            self.sock.close()
+            if self.sock is not None:
+                self.sock.close()
         except Exception:
             pass
 
@@ -85,6 +118,42 @@ LOCAL_BACKUP_ROLLOUT_PATH = os.path.join(
 )
 
 
+class InterprocessFileLock:
+    """Bloqueo atómico entre procesos concurrentes usando un archivo .lock en Windows/Linux."""
+
+    def __init__(self, lock_path: str, timeout: float = 60.0):
+        self.lock_path = lock_path
+        self.timeout = timeout
+        self.fd = None
+
+    def __enter__(self):
+        t0 = time.time()
+        while True:
+            try:
+                self.fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                return self
+            except FileExistsError:
+                if time.time() - t0 > self.timeout:
+                    try:
+                        if time.time() - os.path.getmtime(self.lock_path) > 120.0:
+                            os.remove(self.lock_path)
+                    except OSError:
+                        pass
+                time.sleep(0.15)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        try:
+            os.remove(self.lock_path)
+        except OSError:
+            pass
+
+
 def append_rl_rollout_to_drive(
     ep_states: np.ndarray,
     ep_actions: np.ndarray,
@@ -96,51 +165,55 @@ def append_rl_rollout_to_drive(
     """
     Acumula las trayectorias (states, actions, returns, races, wins) jugadas por el bot
     directamente en Google Drive (G:\\Mi unidad\\hailo_files\\sc2_rl_rollouts.npz) y en respaldo local.
+    Protegido contra colisiones concurrentes de múltiples partidas en paralelo mediante FileLock.
     Retorna el total acumulado de muestras RL.
     """
     target_paths = [rollout_path, LOCAL_BACKUP_ROLLOUT_PATH]
     total_samples = len(ep_states)
+    lock_file = LOCAL_BACKUP_ROLLOUT_PATH + ".lock"
 
-    for path in target_paths:
-        try:
-            parent = os.path.dirname(path)
-            if parent and not os.path.exists(parent):
-                if path == rollout_path:
-                    continue
-                os.makedirs(parent, exist_ok=True)
+    with InterprocessFileLock(lock_file):
+        for path in target_paths:
+            try:
+                parent = os.path.dirname(path)
+                if parent and not os.path.exists(parent):
+                    if path == rollout_path:
+                        continue
+                    os.makedirs(parent, exist_ok=True)
 
-            if os.path.exists(path):
-                old = np.load(path)
-                states = np.concatenate([old["states"], ep_states], axis=0)
-                actions = np.concatenate([old["actions"], ep_actions], axis=0)
-                returns = np.concatenate([old["returns"], ep_returns], axis=0)
-                races = np.concatenate([old["races"], ep_races], axis=0)
-                wins = np.concatenate([old["wins"], np.array([ep_won], dtype=np.int64)], axis=0)
-            else:
-                states = ep_states
-                actions = ep_actions
-                returns = ep_returns
-                races = ep_races
-                wins = np.array([ep_won], dtype=np.int64)
+                if os.path.exists(path):
+                    old = np.load(path)
+                    states = np.concatenate([old["states"], ep_states], axis=0)
+                    actions = np.concatenate([old["actions"], ep_actions], axis=0)
+                    returns = np.concatenate([old["returns"], ep_returns], axis=0)
+                    races = np.concatenate([old["races"], ep_races], axis=0)
+                    wins = np.concatenate([old["wins"], np.array([ep_won], dtype=np.int64)], axis=0)
+                else:
+                    states = ep_states
+                    actions = ep_actions
+                    returns = ep_returns
+                    races = ep_races
+                    wins = np.array([ep_won], dtype=np.int64)
 
-            # Conservar las últimas 25,000 muestras más recientes (Replay Buffer deslizante)
-            if len(states) > 25000:
-                states = states[-25000:]
-                actions = actions[-25000:]
-                returns = returns[-25000:]
-                races = races[-25000:]
+                # Conservar las últimas 25,000 muestras más recientes (Replay Buffer deslizante)
+                if len(states) > 25000:
+                    states = states[-25000:]
+                    actions = actions[-25000:]
+                    returns = returns[-25000:]
+                    races = races[-25000:]
+                    wins = wins[-25000:]
 
-            np.savez_compressed(
-                path,
-                states=states.astype(np.float32),
-                actions=actions.astype(np.int64),
-                returns=returns.astype(np.float32),
-                races=races.astype(np.int64),
-                wins=wins.astype(np.int64),
-            )
-            total_samples = len(states)
-        except Exception as exc:
-            print(f"[Aviso RL] No se pudo guardar en {path}: {exc}")
+                np.savez_compressed(
+                    path,
+                    states=states.astype(np.float32),
+                    actions=actions.astype(np.int64),
+                    returns=returns.astype(np.float32),
+                    races=races.astype(np.int64),
+                    wins=wins.astype(np.int64),
+                )
+                total_samples = len(states)
+            except Exception as exc:
+                print(f"[Aviso RL] No se pudo guardar en {path}: {exc}")
 
     return total_samples
 
@@ -158,6 +231,10 @@ def launch_live_sc2_match(
     collect_rl: bool = False,
     explore_eps: float = 0.20,
     rollout_path: str = DEFAULT_DRIVE_ROLLOUT_PATH,
+    window_x: int = 50,
+    window_y: int = 50,
+    window_w: int = 1024,
+    window_h: int = 768,
 ) -> Dict[str, object]:
     """
     Abre StarCraft II y ejecuta una partida 100% controlada por las 32 acciones del modelo en la Raspberry Pi + Hailo-8.
@@ -217,6 +294,7 @@ def launch_live_sc2_match(
             self.prev_army_val: float = 0.0
             self.prev_workers: float = 12.0
             self.prev_bases: int = 1
+            self.prev_upgrades: int = 0
             # Estructuras aliadas destruidas (acumuladas entre chunks vía on_unit_destroyed)
             self.pending_lost_structure_value: float = 0.0
             self.pending_lost_townhalls: int = 0
@@ -243,6 +321,10 @@ def launch_live_sc2_match(
                 UnitTypeId.NEXUS, UnitTypeId.HATCHERY, UnitTypeId.LAIR, UnitTypeId.HIVE,
             ):
                 self.pending_lost_townhalls += 1
+
+        async def on_upgrade_complete(self, upgrade_id: UpgradeId):
+            """Notificación de Blizzard al finalizar la investigación de una tecnología."""
+            print(f"🔬 [Tech SC2] ¡Mejora completada: {upgrade_id.name}! (+0.50 Recompensa RL)")
 
         async def on_start(self):
             self.client.game_step = 8 if (collect_rl and not realtime) else 4
@@ -436,6 +518,7 @@ def launch_live_sc2_match(
 
             # [10] BUILD_TECH_LAB_CORE_LAIR
             elif act_name == "BUILD_TECH_LAB_CORE_LAIR":
+                loc = self.resolve_build_location(gx, gy, distance_from_base=7.0)
                 if self.race == Race.Terran:
                     for fac in self.structures(UnitTypeId.FACTORY).ready.idle:
                         if not fac.has_add_on and self.can_afford(UnitTypeId.FACTORYTECHLAB):
@@ -449,10 +532,19 @@ def launch_live_sc2_match(
                         if not sp.has_add_on and self.can_afford(UnitTypeId.STARPORTREACTOR):
                             sp.build(UnitTypeId.STARPORTREACTOR)
                             return
-                elif self.race == Race.Protoss and self.can_afford(UnitTypeId.CYBERNETICSCORE):
-                    await self.build(UnitTypeId.CYBERNETICSCORE, near=self.resolve_build_location(gx, gy, 7.0))
-                elif self.race == Race.Zerg and self.townhalls(UnitTypeId.HATCHERY).ready.idle and self.can_afford(UnitTypeId.LAIR):
-                    self.townhalls(UnitTypeId.HATCHERY).ready.idle.first.build(UnitTypeId.LAIR)
+                    if self.structures(UnitTypeId.BARRACKS).ready and self.structures(UnitTypeId.ENGINEERINGBAY).amount < 1 and self.can_afford(UnitTypeId.ENGINEERINGBAY):
+                        await self.build(UnitTypeId.ENGINEERINGBAY, near=loc)
+                        return
+                elif self.race == Race.Protoss:
+                    if self.structures(UnitTypeId.CYBERNETICSCORE).amount < 1 and self.can_afford(UnitTypeId.CYBERNETICSCORE):
+                        await self.build(UnitTypeId.CYBERNETICSCORE, near=loc)
+                    elif self.structures(UnitTypeId.GATEWAY).ready and self.structures(UnitTypeId.FORGE).amount < 1 and self.can_afford(UnitTypeId.FORGE):
+                        await self.build(UnitTypeId.FORGE, near=loc)
+                elif self.race == Race.Zerg:
+                    if self.townhalls(UnitTypeId.HATCHERY).ready.idle and self.can_afford(UnitTypeId.LAIR):
+                        self.townhalls(UnitTypeId.HATCHERY).ready.idle.first.build(UnitTypeId.LAIR)
+                    elif self.structures(UnitTypeId.SPAWNINGPOOL).ready and self.structures(UnitTypeId.EVOLUTIONCHAMBER).amount < 1 and self.can_afford(UnitTypeId.EVOLUTIONCHAMBER):
+                        await self.build(UnitTypeId.EVOLUTIONCHAMBER, near=loc)
 
             # [11] BUILD_DEFENSE_STRUCTURE (Bunker / Missile Turret / Cannon / Spine)
             elif act_name == "BUILD_DEFENSE_STRUCTURE":
@@ -552,20 +644,26 @@ def launch_live_sc2_match(
                 elif self.race == Race.Zerg and self.larva and self.can_afford(UnitTypeId.MUTALISK):
                     self.larva.random.train(UnitTypeId.MUTALISK)
 
-            # [17] RESEARCH_COMBAT_UPGRADE (Stimpack / Combat Shield / Concussive Shells)
+            # [17] RESEARCH_COMBAT_UPGRADE (Stimpack / Combat Shield / Concussive Shells / Warpgate / ZerglingSpeed)
             elif act_name == "RESEARCH_COMBAT_UPGRADE":
-                for lab in self.structures(UnitTypeId.BARRACKSTECHLAB).ready.idle:
-                    if self.can_afford(UpgradeId.STIMPACK):
-                        lab.research(UpgradeId.STIMPACK)
-                        return
-                    if self.can_afford(UpgradeId.SHIELDWALL):
-                        lab.research(UpgradeId.SHIELDWALL)
-                        return
-                    if self.can_afford(UpgradeId.PUNISHERGRENADES):
-                        lab.research(UpgradeId.PUNISHERGRENADES)
-                        return
+                if self.race == Race.Terran:
+                    for lab in self.structures(UnitTypeId.BARRACKSTECHLAB).ready.idle:
+                        for upg in (UpgradeId.STIMPACK, UpgradeId.SHIELDWALL, UpgradeId.PUNISHERGRENADES):
+                            if upg not in self.state.upgrades and self.can_afford(upg):
+                                lab.research(upg)
+                                return
+                elif self.race == Race.Protoss:
+                    for core in self.structures(UnitTypeId.CYBERNETICSCORE).ready.idle:
+                        if UpgradeId.WARPGATERESEARCH not in self.state.upgrades and self.can_afford(UpgradeId.WARPGATERESEARCH):
+                            core.research(UpgradeId.WARPGATERESEARCH)
+                            return
+                elif self.race == Race.Zerg:
+                    for pool in self.structures(UnitTypeId.SPAWNINGPOOL).ready.idle:
+                        if UpgradeId.ZERGLINGMOVEMENTSPEED not in self.state.upgrades and self.can_afford(UpgradeId.ZERGLINGMOVEMENTSPEED):
+                            pool.research(UpgradeId.ZERGLINGMOVEMENTSPEED)
+                            return
 
-            # [18] RESEARCH_WEAPONS_ARMOR (Engineering Bay +1/+2/+3 Infantry Weapons & Armor)
+            # [18] RESEARCH_WEAPONS_ARMOR (Engineering Bay / Forge / Evo +1/+2/+3 Weapons & Armor)
             elif act_name == "RESEARCH_WEAPONS_ARMOR":
                 if self.race == Race.Terran:
                     for eb in self.structures(UnitTypeId.ENGINEERINGBAY).ready.idle:
@@ -574,9 +672,33 @@ def launch_live_sc2_match(
                             UpgradeId.TERRANINFANTRYARMORSLEVEL1,
                             UpgradeId.TERRANINFANTRYWEAPONSLEVEL2,
                             UpgradeId.TERRANINFANTRYARMORSLEVEL2,
+                            UpgradeId.TERRANINFANTRYWEAPONSLEVEL3,
+                            UpgradeId.TERRANINFANTRYARMORSLEVEL3,
                         ):
-                            if self.can_afford(upg):
+                            if upg not in self.state.upgrades and self.can_afford(upg):
                                 eb.research(upg)
+                                return
+                elif self.race == Race.Protoss:
+                    for forge in self.structures(UnitTypeId.FORGE).ready.idle:
+                        for upg in (
+                            UpgradeId.PROTOSSGROUNDWEAPONSLEVEL1,
+                            UpgradeId.PROTOSSGROUNDARMORSLEVEL1,
+                            UpgradeId.PROTOSSSHIELDSLEVEL1,
+                            UpgradeId.PROTOSSGROUNDWEAPONSLEVEL2,
+                            UpgradeId.PROTOSSGROUNDARMORSLEVEL2,
+                        ):
+                            if upg not in self.state.upgrades and self.can_afford(upg):
+                                forge.research(upg)
+                                return
+                elif self.race == Race.Zerg:
+                    for evo in self.structures(UnitTypeId.EVOLUTIONCHAMBER).ready.idle:
+                        for upg in (
+                            UpgradeId.ZERGMELEEWEAPONSLEVEL1,
+                            UpgradeId.ZERGMISSILEWEAPONSLEVEL1,
+                            UpgradeId.ZERGGROUNDARMORSLEVEL1,
+                        ):
+                            if upg not in self.state.upgrades and self.can_afford(upg):
+                                evo.research(upg)
                                 return
 
             # [19] MACRO_CHRONO_MULE_INJECT (Orbital Command + Calldown MULE / Chrono / Larva Inject)
@@ -616,7 +738,7 @@ def launch_live_sc2_match(
 
             # [23] FOCUS_FIRE_TARGET
             elif act_name == "FOCUS_FIRE_TARGET":
-                nearby_enemies = self.enemy_units.closer_than(15.0, target_pt) if self.enemy_units else []
+                nearby_enemies = self.enemy_units.closer_than(22.0, target_pt) if self.enemy_units else []
                 if nearby_enemies and army:
                     weakest = min(nearby_enemies, key=lambda e: e.health + e.shield)
                     for u in army:
@@ -734,6 +856,12 @@ def launch_live_sc2_match(
                     int(np.clip(bgy + int(self.rng.integers(-2, 3)), 0, GRID_H - 1)),
                 )
 
+            def pos_to_grid(pos) -> Tuple[int, int]:
+                return (
+                    int(np.clip((float(pos.x) / map_w) * GRID_W, 0, GRID_W - 1)),
+                    int(np.clip((float(pos.y) / map_h) * GRID_H, 0, GRID_H - 1)),
+                )
+
             def rand_map_cell() -> Tuple[int, int]:
                 return int(self.rng.integers(0, GRID_W)), int(self.rng.integers(0, GRID_H))
 
@@ -772,6 +900,8 @@ def launch_live_sc2_match(
                     candidate_actions.append(("BUILD_TECH_LAB_CORE_LAIR", bgx, bgy))
                     candidate_actions.append(("TRAIN_RANGED_CORE", bgx, bgy))
                     candidate_actions.append(("RESEARCH_COMBAT_UPGRADE", bgx, bgy))
+                if self.structures([UnitTypeId.ENGINEERINGBAY, UnitTypeId.FORGE, UnitTypeId.EVOLUTIONCHAMBER]).ready and self.minerals >= 100:
+                    candidate_actions.append(("RESEARCH_WEAPONS_ARMOR", bgx, bgy))
                 if self.minerals >= 150 and self.vespene >= 100 and self.structures(UnitTypeId.FACTORY).amount < 2:
                     candidate_actions.append(("BUILD_FACTORY_ROBO_ROACH", *near_base_cell()))
             if self.structures(UnitTypeId.FACTORY).ready:
@@ -782,16 +912,32 @@ def launch_live_sc2_match(
                 candidate_actions.append(("TRAIN_AIR_UNIT", bgx, bgy))
 
             # Candidatos de combate y micro (muestreando celdas con enemigos visibles en Canal 3 o zonas no exploradas)
-            if self.supply_army >= 12:
+            if self.supply_army >= 8:
                 cx, cy = sample_combat_cell()
                 candidate_actions.append(("ATTACK_MOVE_COORDINATE", cx, cy))
                 candidate_actions.append(("FOCUS_FIRE_TARGET", cx, cy))
                 # Habilidades sin destino espacial: solo se exploran cuando existen las unidades que las usan
-                if self.enemy_units and self.units([UnitTypeId.MARINE, UnitTypeId.MARAUDER]):
+                if self.enemy_units and self.units([UnitTypeId.MARINE, UnitTypeId.MARAUDER]) and UpgradeId.STIMPACK in self.state.upgrades:
                     candidate_actions.append(("MICRO_USE_STIM_ABILITY", cx, cy))
                 if self.units([UnitTypeId.SIEGETANK, UnitTypeId.SIEGETANKSIEGED]):
                     candidate_actions.append(("MICRO_SIEGE_TRANSFORM", cx, cy))
-            if self.enemy_units and self.townhalls and self.enemy_units.closer_than(25.0, self.townhalls.first):
+
+            # Si hay enemigos hostiles amenazando cualquier estructura o trabajador aliado, generar candidatos defensivos inmediatos
+            base_threats = [
+                eu for eu in self.enemy_units
+                if any(s.distance_to(eu) <= 25.0 for s in self.structures)
+                or any(w.distance_to(eu) <= 15.0 for w in self.workers)
+            ] if self.enemy_units else []
+            if base_threats:
+                closest_threat = min(
+                    base_threats,
+                    key=lambda eu: min((s.distance_to(eu) for s in self.structures), default=0.0)
+                )
+                tgx, tgy = pos_to_grid(closest_threat.position)
+                candidate_actions.append(("DEFEND_MAIN_NATURAL", tgx, tgy))
+                candidate_actions.append(("ATTACK_MOVE_COORDINATE", tgx, tgy))
+                candidate_actions.append(("FOCUS_FIRE_TARGET", tgx, tgy))
+            elif self.enemy_units and self.townhalls and self.enemy_units.closer_than(25.0, self.townhalls.first):
                 candidate_actions.append(("DEFEND_MAIN_NATURAL", bgx, bgy))
 
             if not candidate_actions:
@@ -829,23 +975,49 @@ def launch_live_sc2_match(
             army_val = float(score.total_value_units)
             workers = float(self.supply_workers)
             bases = int(self.townhalls.amount)
+            upgrades = len(self.state.upgrades)
 
             d_killed = killed_val - self.prev_killed_val
             d_army = army_val - self.prev_army_val
             d_workers = workers - self.prev_workers
             d_bases = bases - self.prev_bases
+            d_upgrades = upgrades - self.prev_upgrades
 
             self.prev_killed_val = killed_val
             self.prev_army_val = army_val
             self.prev_workers = workers
             self.prev_bases = bases
+            self.prev_upgrades = upgrades
+
+            ready_th = self.townhalls.ready
+            not_ready_th = self.townhalls.not_ready
+            ready_gas = self.gas_buildings.ready
+            total_th_count = len(ready_th) + len(not_ready_th)
+            ideal_harv = sum(th.ideal_harvesters for th in ready_th) + sum(g.ideal_harvesters for g in ready_gas)
+            max_useful_workers = max(16, ideal_harv + 3 * total_th_count) if total_th_count else 22
+
+            # Solo premiar crecimiento de trabajadores si hay capacidad útil; penalizar si entrena más estando sobresaturado
+            if workers <= max_useful_workers:
+                worker_reward = 0.15 * d_workers
+            else:
+                worker_reward = -0.08 * max(0.0, d_workers)
 
             r = (
                 (d_killed / 200.0)
                 + (d_army / 400.0)
-                + (0.15 * d_workers)
+                + worker_reward
                 + (0.80 * max(0, d_bases))
+                + (0.50 * max(0, d_upgrades))
             )
+
+            # Eficiencia económica por trabajador (tasa de recolección real de Blizzard / obreros)
+            current_rate = float(score.collection_rate_minerals) + float(score.collection_rate_vespene)
+            if workers >= 12:
+                eta = current_rate / workers
+                if eta >= 48.0:
+                    r += 0.05
+                elif eta < 28.0 and not not_ready_th:
+                    r -= 0.05
 
             # Penalización por estructuras aliadas destruidas (misma escala que el premio por estructuras enemigas)
             if self.pending_lost_structure_value > 0.0:
@@ -854,10 +1026,34 @@ def launch_live_sc2_match(
                 self.pending_lost_structure_value = 0.0
                 self.pending_lost_townhalls = 0
 
+            # Penalización por sobresaturación de bases (obreros ociosos amontonados en minerales)
+            # Solo aplica si no hay bases en construcción (no penaliza pre-entrenamiento legítimo para transfer)
+            if ready_th and not not_ready_th:
+                total_surplus_minerals = sum(max(0, th.surplus_harvesters) for th in ready_th)
+                if total_surplus_minerals >= 4:
+                    r -= min(0.15, 0.03 * total_surplus_minerals)
+
             if self.supply_left <= 0 and self.supply_cap < 200 and self.minerals >= 100:
                 r -= 0.15
             if self.minerals > 600 and self.supply_used < 185:
                 r -= 0.10
+
+            # Monitoreo y recompensa de defensa activa ante amenazas a estructuras o trabajadores
+            base_threats = [
+                eu for eu in self.enemy_units
+                if any(s.distance_to(eu) <= 22.0 for s in self.structures)
+                or any(w.distance_to(eu) <= 14.0 for w in self.workers)
+            ] if self.enemy_units else []
+            combat_army = self.units.exclude_type([UnitTypeId.SCV, UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.MULE, UnitTypeId.OVERLORD])
+            if base_threats and combat_army:
+                defending_units = sum(
+                    1 for u in combat_army
+                    if any(u.distance_to(bt) <= 16.0 for bt in base_threats)
+                )
+                if defending_units == 0:
+                    r -= 0.30  # Penalización por negligencia: invasores atacando base/estructuras y el ejército no reacciona
+                else:
+                    r += 0.20  # Recompensa por interceptar activamente y repeler la invasión
 
             # Evaluación espacial de la atención (Canal 3 = enemigos visibles, Canal 0 = unidades propias)
             if self.rl_states and self.rl_actions:
@@ -880,7 +1076,7 @@ def launch_live_sc2_match(
                         if has_visible_enemies:
                             if local_enemy > 0.0:
                                 spatial_delta = max(spatial_delta, 0.30)
-                            elif act_id in (22, 23) and spatial_delta == 0.0:
+                            elif act_id in (22, 23, 28) and spatial_delta == 0.0:
                                 spatial_delta = min(spatial_delta, -0.25)
                         else:
                             # Sin enemigos visibles: penalizar quedarse atacando la celda vacía donde ya está nuestro ejército
@@ -972,20 +1168,15 @@ def launch_live_sc2_match(
                 while len(self.rl_rewards) < len(self.rl_states):
                     self.rl_rewards.append(self.compute_chunk_reward())
 
-                # Recompensa terminal: Victoria real (+10), Tiempo agotado (+2.5 / -2.5), o Derrota real (-8)
+                # Recompensa terminal: Solo Victoria real (+10) cuenta como victoria.
+                # Tiempo agotado recibe penalización leve (-1.25, won=0) para no sofocar el turtling o juego macro.
                 won = 0
                 if game_result == Result.Victory:
                     terminal_bonus = 10.0
                     won = 1
                 elif self.reached_step_limit:
-                    score = self.state.score
-                    net_adv = (
-                        float(score.killed_value_units)
-                        + 1.5 * float(score.killed_value_structures)
-                        + 0.5 * float(score.total_value_units)
-                    )
-                    terminal_bonus = 2.5 if (net_adv >= 1800.0 or self.supply_army >= 22) else -2.5
-                    won = 1 if terminal_bonus > 0 else 0
+                    terminal_bonus = -1.25
+                    won = 0
                 elif game_result == Result.Defeat:
                     terminal_bonus = -8.0
                     won = 0
@@ -1030,22 +1221,25 @@ def launch_live_sc2_match(
             if self.lan_client is not None:
                 self.lan_client.close()
 
-    if human_vs_ai:
-        import sc2.main as sc2_main
-        orig_sc2_proc = sc2_main.SC2Process
-        instance_counter = {"count": 0}
+    import sc2.main as sc2_main
+    orig_sc2_proc = sc2_main.SC2Process
+    instance_counter = {"count": 0}
 
-        def patched_sc2_process(*args, **kwargs):
-            instance_counter["count"] += 1
+    def patched_sc2_process(*args, **kwargs):
+        instance_counter["count"] += 1
+        if human_vs_ai:
             if instance_counter["count"] == 1:
                 kwargs.setdefault("resolution", (1280, 720))
                 kwargs.setdefault("placement", (50, 50))
             else:
                 kwargs.setdefault("resolution", (320, 240))
                 kwargs.setdefault("placement", (1400, 700))
-            return orig_sc2_proc(*args, **kwargs)
+        else:
+            kwargs.setdefault("resolution", (window_w, window_h))
+            kwargs.setdefault("placement", (window_x, window_y))
+        return orig_sc2_proc(*args, **kwargs)
 
-        sc2_main.SC2Process = patched_sc2_process
+    sc2_main.SC2Process = patched_sc2_process
 
     players_list = (
         [
@@ -1086,15 +1280,116 @@ def _disable_windows_quickedit():
         pass
 
 
-def _cleanup_orphan_sc2():
-    """Limpia cualquier proceso SC2_x64.exe huérfano o bloqueado antes/después de cada episodio."""
+def _cleanup_orphan_sc2(pid: Optional[int] = None):
+    """Limpia procesos SC2_x64.exe huérfanos. Si se pasa un PID específico, solo mata ese proceso."""
     if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/F", "/IM", "SC2_x64.exe", "/T"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+        if pid is not None:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        else:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "SC2_x64.exe", "/T"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+
+
+def _run_single_episode_worker(
+    worker_id: int,
+    ep: int,
+    total_episodes: int,
+    curr_map: str,
+    curr_enemy: str,
+    curr_diff: str,
+    ep_eps: float,
+    rpi_ip: str,
+    port: int,
+    player_race: str,
+    max_game_steps: int,
+    rollout_path: str,
+    project_root: str,
+) -> Dict[str, object]:
+    summary: Dict[str, object] = {}
+    win_w, win_h = 640, 480
+    col = worker_id % 3
+    row = worker_id // 3
+    win_x = 40 + col * 660
+    win_y = 40 + row * 510
+
+    for attempt in (1, 2):
+        print(
+            f"\n▶️ [Worker {worker_id} | Ep {ep:02d}/{total_episodes:02d} | Intento {attempt}/2] "
+            f"Iniciando {curr_map} ({player_race} vs {curr_enemy} [{curr_diff}], eps={ep_eps:.2f})...",
+            flush=True,
         )
+        fd, summary_json_path = tempfile.mkstemp(prefix=f"sc2_w{worker_id}_ep{ep}_", suffix=".json")
+        os.close(fd)
+        cmd = [
+            sys.executable,
+            "-u",
+            "-m",
+            "src.pc_sc2_client",
+            "--single-rl-ep",
+            "--rpi-ip",
+            rpi_ip,
+            "--port",
+            str(port),
+            "--map",
+            curr_map,
+            "--race",
+            player_race,
+            "--enemy-race",
+            curr_enemy,
+            "--difficulty",
+            curr_diff,
+            "--max-steps",
+            str(max_game_steps),
+            "--explore-eps",
+            f"{ep_eps:.4f}",
+            "--rollout-path",
+            rollout_path,
+            "--summary-json",
+            summary_json_path,
+            "--window-x",
+            str(win_x),
+            "--window-y",
+            str(win_y),
+            "--window-w",
+            str(win_w),
+            "--window-h",
+            str(win_h),
+        ]
+        proc = subprocess.Popen(cmd, cwd=project_root)
+        try:
+            proc.wait(timeout=240)
+            if os.path.exists(summary_json_path) and os.path.getsize(summary_json_path) > 0:
+                with open(summary_json_path, "r", encoding="utf-8") as sf:
+                    summary = json.load(sf)
+        except subprocess.TimeoutExpired:
+            print(
+                f"⚠️ [Supervisor Anti-Hang W{worker_id}] SC2_x64.exe excedió 240s en Ep {ep:02d} (intento {attempt}/2). "
+                f"Terminando PID {proc.pid}...",
+                flush=True,
+            )
+            _cleanup_orphan_sc2(pid=proc.pid)
+        finally:
+            if os.path.exists(summary_json_path):
+                try:
+                    os.remove(summary_json_path)
+                except OSError:
+                    pass
+            _cleanup_orphan_sc2(pid=proc.pid)
+            time.sleep(1.0)
+
+        if summary.get("steps_recorded", 0) > 0:
+            break
+
+    return summary
 
 
 def run_rl_collection_loop(
@@ -1106,10 +1401,13 @@ def run_rl_collection_loop(
     max_game_steps: int = 2400,
     explore_eps: float = 0.20,
     rollout_path: str = DEFAULT_DRIVE_ROLLOUT_PATH,
+    workers: int = 1,
 ):
     """
-    Ejecuta un bucle automático de N partidas aceleradas (realtime=False) a prueba de bloqueos:
-    - Cada episodio corre en un subproceso aislado con timeout estricto (240s) y limpieza de SC2_x64.exe.
+    Ejecuta un bucle automático de N partidas aceleradas a prueba de bloqueos:
+    - Soporta ejecución secuencial (workers=1) o concurrente en paralelo (workers=2..4).
+    - Cada worker gestiona su propia ventana y proceso SC2_x64.exe con timeout estricto.
+    - El guardado en Google Drive está protegido contra colisiones mediante InterprocessFileLock.
     - Rota entre mapas oficiales y las 3 razas enemigas (Zerg, Terran, Protoss).
     - Si el porcentaje de victorias alcanza >= 60%, sube automáticamente la dificultad
       (Easy -> Medium -> Hard -> VeryHard).
@@ -1119,129 +1417,104 @@ def run_rl_collection_loop(
     time.sleep(1.0)
 
     diff_ladder = ["Easy", "Medium", "Hard", "VeryHard"]
-    curr_diff_idx = diff_ladder.index(start_difficulty) if start_difficulty in diff_ladder else 0
+    curr_diff_idx = [diff_ladder.index(start_difficulty) if start_difficulty in diff_ladder else 0]
     map_pool = ["Simple64", "AbyssalReefLE", "BelShirVestigeLE", "CactusValleyLE"]
     enemy_races = ["Zerg", "Terran", "Protoss"]
 
+    import concurrent.futures
+    import queue
+    import threading
+
     recent_wins: List[int] = []
-    total_wins = 0
-    completed_eps = 0
+    stats_lock = threading.Lock()
+    total_wins = [0]
+    completed_eps = [0]
     t_start = time.perf_counter()
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     print("============================================================================")
-    print(f" 🚀 INICIANDO RECOLECCIÓN RL ACELERADA ({episodes} Partidas | Supervisor Anti-Hang)")
+    print(f" 🚀 INICIANDO RECOLECCIÓN RL ({episodes} Partidas | {workers} Workers en Paralelo)")
     print(f" 📁 Guardado automático en Drive: {rollout_path}")
     print("============================================================================")
 
+    ep_queue = queue.Queue()
     for ep in range(1, episodes + 1):
-        curr_diff = diff_ladder[curr_diff_idx]
-        curr_map = map_pool[(ep - 1) % len(map_pool)]
-        curr_enemy = enemy_races[(ep - 1) % len(enemy_races)]
-        ep_eps = max(0.08, explore_eps * (1.0 - 0.4 * ((ep - 1) / max(1, episodes))))
+        ep_queue.put(ep)
 
-        summary: Dict[str, object] = {}
-        ep_t0 = time.perf_counter()
-
-        for attempt in (1, 2):
-            print(
-                f"\n▶️ [Episodio {ep:02d}/{episodes:02d} | Intento {attempt}/2] "
-                f"Iniciando {curr_map} ({player_race} vs {curr_enemy} [{curr_diff}], eps={ep_eps:.2f})...",
-                flush=True,
-            )
-            fd, summary_json_path = tempfile.mkstemp(prefix="sc2_ep_", suffix=".json")
-            os.close(fd)
-            cmd = [
-                sys.executable,
-                "-u",
-                "-m",
-                "src.pc_sc2_client",
-                "--single-rl-ep",
-                "--rpi-ip",
-                rpi_ip,
-                "--port",
-                str(port),
-                "--map",
-                curr_map,
-                "--race",
-                player_race,
-                "--enemy-race",
-                curr_enemy,
-                "--difficulty",
-                curr_diff,
-                "--max-steps",
-                str(max_game_steps),
-                "--explore-eps",
-                f"{ep_eps:.4f}",
-                "--rollout-path",
-                rollout_path,
-                "--summary-json",
-                summary_json_path,
-            ]
-            proc = subprocess.Popen(cmd, cwd=project_root)
+    def worker_loop(worker_id: int):
+        while not ep_queue.empty():
             try:
-                proc.wait(timeout=240)
-                if os.path.exists(summary_json_path) and os.path.getsize(summary_json_path) > 0:
-                    with open(summary_json_path, "r", encoding="utf-8") as sf:
-                        summary = json.load(sf)
-            except subprocess.TimeoutExpired:
-                print(
-                    f"⚠️ [Supervisor Anti-Hang] SC2_x64.exe excedió 240s en Episodio {ep:02d} (intento {attempt}/2). "
-                    f"Terminando árbol de procesos...",
-                    flush=True,
-                )
-                if os.name == "nt":
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                    )
-                else:
-                    proc.kill()
-            finally:
-                if os.path.exists(summary_json_path):
-                    try:
-                        os.remove(summary_json_path)
-                    except OSError:
-                        pass
-                _cleanup_orphan_sc2()
-                time.sleep(2.0)
-
-            if summary.get("steps_recorded", 0) > 0:
+                ep = ep_queue.get_nowait()
+            except queue.Empty:
                 break
 
-        ep_sec = time.perf_counter() - ep_t0
-        if summary.get("steps_recorded", 0) == 0:
-            print(f"⚠️ [Supervisor] Episodio {ep:02d} omitido tras 2 intentos fallidos de SC2_x64.exe. Continuando...")
-            continue
+            with stats_lock:
+                c_diff = diff_ladder[curr_diff_idx[0]]
+            c_map = map_pool[(ep - 1) % len(map_pool)]
+            c_enemy = enemy_races[(ep - 1) % len(enemy_races)]
+            ep_eps = max(0.08, explore_eps * (1.0 - 0.4 * ((ep - 1) / max(1, episodes))))
 
-        completed_eps += 1
-        won = int(summary.get("won", 0))
-        total_wins += won
-        recent_wins.append(won)
-        if len(recent_wins) > 8:
-            recent_wins.pop(0)
+            ep_t0 = time.perf_counter()
+            summary = _run_single_episode_worker(
+                worker_id=worker_id,
+                ep=ep,
+                total_episodes=episodes,
+                curr_map=c_map,
+                curr_enemy=c_enemy,
+                curr_diff=c_diff,
+                ep_eps=ep_eps,
+                rpi_ip=rpi_ip,
+                port=port,
+                player_race=player_race,
+                max_game_steps=max_game_steps,
+                rollout_path=rollout_path,
+                project_root=project_root,
+            )
+            ep_sec = time.perf_counter() - ep_t0
 
-        rolling_wr = (sum(recent_wins) / len(recent_wins)) * 100.0
-        overall_wr = (total_wins / max(1, completed_eps)) * 100.0
-        elapsed_min = (time.perf_counter() - t_start) / 60.0
+            if summary.get("steps_recorded", 0) > 0:
+                with stats_lock:
+                    completed_eps[0] += 1
+                    won = int(summary.get("won", 0))
+                    total_wins[0] += won
+                    recent_wins.append(won)
+                    if len(recent_wins) > 8:
+                        recent_wins.pop(0)
 
-        print(
-            f"📊 [Episodio {ep:02d}/{episodes:02d} | {ep_sec:.1f}s | Total {elapsed_min:.1f}m] "
-            f"Mapa: {curr_map} vs {curr_enemy} ({curr_diff}) | "
-            f"WinRate Global: {overall_wr:.1f}% ( Reciente: {rolling_wr:.1f}% ) | "
-            f"Muestras Drive: {summary.get('total_buffer_samples', 0)}"
-        )
+                    rolling_wr = (sum(recent_wins) / len(recent_wins)) * 100.0
+                    overall_wr = (total_wins[0] / max(1, completed_eps[0])) * 100.0
+                    elapsed_min = (time.perf_counter() - t_start) / 60.0
 
-        # Promoción automática de currículum si domina el nivel actual (>= 60% en últimas 5+ partidas)
-        if len(recent_wins) >= 5 and rolling_wr >= 60.0 and curr_diff_idx < len(diff_ladder) - 1:
-            curr_diff_idx += 1
-            recent_wins.clear()
-            print(f"🔥 ¡CURRÍCULUM SUPERADO! Subiendo dificultad automáticamente a: {diff_ladder[curr_diff_idx]}")
+                    print(
+                        f"📊 [W{worker_id} | Ep {ep:02d}/{episodes:02d} | {ep_sec:.1f}s | Total {elapsed_min:.1f}m] "
+                        f"Mapa: {c_map} vs {c_enemy} ({c_diff}) | "
+                        f"WinRate Global: {overall_wr:.1f}% ( Reciente: {rolling_wr:.1f}% ) | "
+                        f"Muestras Drive: {summary.get('total_buffer_samples', 0)}"
+                    )
 
+                    # Promoción automática de currículum si domina el nivel actual (>= 60% en últimas 5+ partidas)
+                    if len(recent_wins) >= 5 and rolling_wr >= 60.0 and curr_diff_idx[0] < len(diff_ladder) - 1:
+                        curr_diff_idx[0] += 1
+                        recent_wins.clear()
+                        print(f"🔥 ¡CURRÍCULUM SUPERADO! Subiendo dificultad automáticamente a: {diff_ladder[curr_diff_idx[0]]}")
+            else:
+                print(f"⚠️ [Supervisor W{worker_id}] Episodio {ep:02d} omitido tras 2 intentos fallidos de SC2_x64.exe.")
+
+            ep_queue.task_done()
+
+    effective_workers = max(1, min(workers, episodes))
+    if effective_workers == 1:
+        worker_loop(worker_id=0)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = [executor.submit(worker_loop, w_id) for w_id in range(effective_workers)]
+            concurrent.futures.wait(futures)
+
+    final_comp = completed_eps[0]
+    final_wins = total_wins[0]
+    final_wr = (final_wins / max(1, final_comp)) * 100.0
     print("============================================================================")
-    print(f" 🎉 Recolección RL completada ({completed_eps} partidas, WinRate: {(total_wins/max(1,completed_eps))*100:.1f}%).")
+    print(f" 🎉 Recolección RL completada ({final_comp} partidas, WinRate: {final_wr:.1f}%).")
     print(f" 👉 Ahora abre SC2_Hailo8_Transformer.ipynb en Google Colab y ejecuta la Celda RL.")
     print("============================================================================")
 
@@ -1255,12 +1528,17 @@ if __name__ == "__main__":
     parser.add_argument("--single-rl-ep", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--summary-json", default="", help=argparse.SUPPRESS)
     parser.add_argument("--episodes", type=int, default=30, help="Número de partidas aceleradas a jugar en modo --collect-rl")
+    parser.add_argument("--workers", type=int, default=1, help="Número de partidas concurrentes en paralelo (ej. 2 o 3)")
+    parser.add_argument("--window-x", type=int, default=50, help=argparse.SUPPRESS)
+    parser.add_argument("--window-y", type=int, default=50, help=argparse.SUPPRESS)
+    parser.add_argument("--window-w", type=int, default=1024, help=argparse.SUPPRESS)
+    parser.add_argument("--window-h", type=int, default=768, help=argparse.SUPPRESS)
     parser.add_argument("--explore-eps", type=float, default=0.20, help="Probabilidad de exploración táctica en modo --collect-rl")
     parser.add_argument("--rollout-path", default=DEFAULT_DRIVE_ROLLOUT_PATH, help="Ruta del archivo .npz en Google Drive")
     parser.add_argument("--map", default="AbyssalReefLE", help="Nombre del mapa en StarCraft II/Maps")
     parser.add_argument("--race", default="Terran", choices=["Terran", "Protoss", "Zerg"])
     parser.add_argument("--enemy-race", default="Terran", choices=["Terran", "Protoss", "Zerg", "Random"])
-    parser.add_argument("--difficulty", default="Medium", choices=["VeryEasy", "Easy", "Medium", "Hard", "VeryHard"])
+    parser.add_argument("--difficulty", default="Easy", choices=["VeryEasy", "Easy", "Medium", "Hard", "VeryHard"])
     parser.add_argument("--realtime", action="store_true", help="Ejecutar en velocidad humana en vez de acelerada")
     parser.add_argument("--human", action="store_true", help="Jugar tú mismo (Humano) contra tu Raspberry Pi + Hailo-8")
     parser.add_argument("--max-steps", type=int, default=0, help="Límite opcional de pasos (0 = partida completa)")
@@ -1281,6 +1559,10 @@ if __name__ == "__main__":
             collect_rl=True,
             explore_eps=args.explore_eps,
             rollout_path=args.rollout_path,
+            window_x=args.window_x,
+            window_y=args.window_y,
+            window_w=args.window_w,
+            window_h=args.window_h,
         )
         if args.summary_json:
             with open(args.summary_json, "w", encoding="utf-8") as jf:
@@ -1295,6 +1577,7 @@ if __name__ == "__main__":
             max_game_steps=args.max_steps if args.max_steps > 0 else 2400,
             explore_eps=args.explore_eps,
             rollout_path=args.rollout_path,
+            workers=args.workers,
         )
     elif args.play:
         launch_live_sc2_match(

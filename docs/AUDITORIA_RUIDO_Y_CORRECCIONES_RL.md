@@ -62,6 +62,7 @@ En [`src/pc_sc2_client.py`](file:///C:/Users/Stalin/.gemini/antigravity/scratch/
 5. **`[15] TRAIN_SIEGE_HEAVY`:** Se eliminó la orden que construía automáticamente un Tech Lab en la fábrica.
 6. **`[18] RESEARCH_WEAPONS_ARMOR`:** Se eliminó la orden que construía automáticamente la Bahía de Ingeniería.
 7. **Exploración:** Se eliminó la acción espuria que bajaba depósitos sin motivo táctico y el uso de Stim/Siege cuando no existían unidades militares en el campo.
+8. **Fidelidad Espacial en Defensa (`DEFEND_MAIN_NATURAL` [28]):** Se eliminó cualquier atajo global en la ejecución: las unidades defienden exclusivamente alrededor de la coordenada `target_pt` predicha por la red neuronal. La red misma debe orientar su cabezal espacial hacia los invasores. Para facilitarle el descubrimiento sin muletillas durante el muestreo $\varepsilon$-greedy (`apply_rl_exploration`), la presencia de invasores cerca de estructuras o trabajadores genera candidatos de exploración (`DEFEND_MAIN_NATURAL`, `ATTACK_MOVE_COORDINATE`, `FOCUS_FIRE_TARGET`) apuntando a la celda exacta del atacante.
 
 ---
 
@@ -73,13 +74,18 @@ En [`compute_chunk_reward`](file:///C:/Users/Stalin/.gemini/antigravity/scratch/
 - **Daño a unidades enemigas:** $+\frac{\Delta \text{killed\_units}}{200.0}$
 - **Daño a estructuras enemigas:** $+1.5 \times \frac{\Delta \text{killed\_structures}}{200.0}$
 - **Crecimiento de ejército:** $+\frac{\Delta \text{army\_value}}{400.0}$
-- **Producción de obreros:** $+0.15 \times \Delta \text{SCVs}$
+- **Producción de obreros útil:** $+0.15 \times \Delta \text{SCVs}$ únicamente mientras haya capacidad económica útil ($\le \text{ideal\_harvesters} + 3 \times \text{bases}$). Si la base ya está sobresaturada, entrenar más obreros penaliza $-0.08$.
 - **Expansión económica:** $+0.80$ por nuevo Centro de Mando / base.
+- **Investigación tecnológica completada:** $+0.50$ por cada mejora terminada (Stimpack, Combat Shield, +1/+2/+3 armas y armadura), compensando el costo y reforzando el salto tecnológico.
+- **Eficiencia económica laboral ($\eta$):** $+0.05$ cuando la tasa real de recolección de Blizzard supera los $48\text{ recursos/min por SCV}$. Si la eficiencia cae bajo 28 recursos/min (sin estar expandiéndose), penaliza $-0.05$.
+- **Defensa activa de base y estructuras:** $+0.20$ por chunk cuando existen invasores hostiles en el perímetro de estructuras o trabajadores aliados ($\le 22$ unidades) y unidades del ejército militar las interceptan a corta distancia ($\le 16$ unidades).
 - **Atención a enemigos visibles:** $+0.30$ cuando una acción de combate apunta a $\le 1$ celda de donde el Canal 3 muestra hostiles.
 - **Exploración territorial (Count-Based):** $+0.12$ (una sola vez por celda) cuando el ejército recorre una casilla de la malla $16 \times 16$ nunca antes visitada en la partida.
-- **Terminal:** Victoria real $+10.0$ (o $+2.5$ por ventaja notable en timeout).
+- **Terminal:** Victoria real $+10.0$ exclusivamente (`Result.Victory`). Los empates por tiempo agotado (`reached_step_limit`) reciben una penalización suave de $-1.25$ y `won = 0` (preservando la validez del turtling y juego macro sin regalar victorias ficticias).
 
 ### Penalizaciones ($-$):
+- **Negligencia defensiva de base:** $-0.30$ por chunk si hay enemigos hostiles en el perímetro de estructuras o trabajadores aliados pero el ejército militar no reacciona ni intercepta a los atacantes.
+- **Sobresaturación de bases:** Si los obreros asignados a una base exceden la capacidad ideal en $\ge 4$ trabajadores (`surplus_harvesters >= 4`), se aplica una penalización continua de $-\min(0.15, 0.03 \times \text{exceso})$. Incentiva a la IA a expandirse (`BUILD_EXPAND_BASE`) o producir ejército en lugar de amontonar trabajadores ociosos.
 - **Estructuras aliadas destruidas:** Se calcula mediante el hook [`on_unit_destroyed`](file:///C:/Users/Stalin/.gemini/antigravity/scratch/sc2-hailo8-transformer/src/pc_sc2_client.py#L227-L245) que registra el costo real en minerales y gas de cada estructura derribada:
   $$\Delta r_{\text{lost}} = -1.5 \times \frac{\text{valor}}{200.0} - 0.80 \times \text{townhalls\_perdidos}$$
   *(Las cancelaciones voluntarias antes del colapso no reciben penalización).*
@@ -87,7 +93,7 @@ En [`compute_chunk_reward`](file:///C:/Users/Stalin/.gemini/antigravity/scratch/
 - **Estancamiento en ruinas:** $-0.20$ si no hay enemigos visibles y el ejército insiste en atacar la misma celda vacía donde ya está situado.
 - **Bloqueo de suministro (*Supply Block*):** $-0.15$ si `supply_left <= 0` con minerales suficientes.
 - **Acumulación ociosa (*Floating Minerals*):** $-0.10$ si acumula $>600$ minerales con suministro $<185$.
-- **Terminal:** Derrota $-8.0$ (o $-2.5$ por desventaja en timeout).
+- **Terminal:** Derrota real $-8.0$ exclusivamente (`Result.Defeat`).
 
 ---
 
