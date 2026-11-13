@@ -233,7 +233,7 @@ def test_torch_training_and_onnx(tmpdir: str, run_onnx: bool):
         mlp_ratio=cfg.mlp_ratio,
         dropout=0.0,
     ).eval()
-    critic = SC2HailoV2Critic(hidden_dim=cfg.d_model).eval()
+    critic = SC2HailoV2Critic().eval()
 
     n_params = count_parameters(actor)
     assert n_params < 600_000, f"Actor demasiado pesado: {n_params}"

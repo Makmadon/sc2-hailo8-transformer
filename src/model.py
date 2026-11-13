@@ -58,7 +58,7 @@ class HailoDualAttentionBlock(nn.Module):
       4. FFN espacial (ConvNeXt) + FFN global (Conv 1x1).
     """
 
-    def __init__(self, d_model: int = 96, n_heads: int = 4, mlp_ratio: int = 2, dropout: float = 0.05):
+    def __init__(self, d_model: int = 64, n_heads: int = 4, mlp_ratio: int = 2, dropout: float = 0.05):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
@@ -177,7 +177,7 @@ class SC2HailoV2Actor(nn.Module):
         map_channels: int = MAP_CHANNELS,
         global_dim: int = GLOBAL_DIM,
         stem_channels: int = 48,
-        d_model: int = 96,
+        d_model: int = 64,
         n_heads: int = 4,
         num_layers: int = 3,
         mlp_ratio: int = 2,
@@ -201,11 +201,12 @@ class SC2HailoV2Actor(nn.Module):
         self.pos_embed = nn.Parameter(torch.randn(1, d_model, BOTTLENECK_H, BOTTLENECK_W) * 0.02)
 
         # Encoder global [B, 64, 1, 1] -> [B, d_model, 1, 4]
+        global_hidden = max(96, d_model)
         self.global_enc = nn.Sequential(
-            nn.Conv2d(global_dim, 128, kernel_size=1, bias=False),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(global_dim, global_hidden, kernel_size=1, bias=False),
+            nn.BatchNorm2d(global_hidden),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, d_model * GLOBAL_TOKENS, kernel_size=1, bias=True),
+            nn.Conv2d(global_hidden, d_model * GLOBAL_TOKENS, kernel_size=1, bias=True),
         )
         self.global_pos = nn.Parameter(torch.randn(1, d_model, 1, GLOBAL_TOKENS) * 0.02)
 
@@ -232,17 +233,19 @@ class SC2HailoV2Actor(nn.Module):
 
         # Cabezales discretos Macro y Micro [B, 2*d_model, 1, 1] -> logits
         head_in = d_model * 2
+        macro_hidden = max(96, d_model)
+        micro_hidden = max(64, d_model)
         self.macro_head = nn.Sequential(
-            nn.Conv2d(head_in, 128, kernel_size=1, bias=False),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(head_in, macro_hidden, kernel_size=1, bias=False),
+            nn.BatchNorm2d(macro_hidden),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, NUM_MACRO, kernel_size=1, bias=True),
+            nn.Conv2d(macro_hidden, NUM_MACRO, kernel_size=1, bias=True),
         )
         self.micro_head = nn.Sequential(
-            nn.Conv2d(head_in, 96, kernel_size=1, bias=False),
-            nn.BatchNorm2d(96),
+            nn.Conv2d(head_in, micro_hidden, kernel_size=1, bias=False),
+            nn.BatchNorm2d(micro_hidden),
             nn.ReLU(inplace=True),
-            nn.Conv2d(96, NUM_MICRO, kernel_size=1, bias=True),
+            nn.Conv2d(micro_hidden, NUM_MICRO, kernel_size=1, bias=True),
         )
 
         # Decoder espacial U-Net 16x16 -> 32x32 con skip connection

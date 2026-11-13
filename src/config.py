@@ -97,7 +97,7 @@ SPATIAL_CELLS: int = GRID_H * GRID_W                          # 1,024
 
 @dataclass
 class V2Config:
-    d_model: int = 96
+    d_model: int = 64
     stem_channels: int = 48
     n_heads: int = 4
     num_layers: int = 3
