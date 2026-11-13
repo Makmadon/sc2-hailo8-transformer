@@ -6,8 +6,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
 echo "=========================================================="
-echo "  Hailo Dataflow Compiler (DFC) - Compilador Local WSL    "
-echo "  Modelo: SC2HailoTransformer -> sc2_hailo8_agent.hef     "
+echo "  Hailo Dataflow Compiler (DFC) - Compilador V2 en WSL    "
+echo "  Modelo: SC2HailoV2Actor -> models/sc2_v2_agent.hef      "
 echo "=========================================================="
 
 # 1. Activar entorno virtual si existe
@@ -33,7 +33,7 @@ echo "[WSL] Ejecutando compilación ONNX -> HAR -> HEF..."
 python3 src/compile_hef.py "$@"
 
 echo "=========================================================="
-echo "✅ Compilación completada con éxito."
-echo "   Archivo generado: models/sc2_hailo8_agent.hef"
-echo "   Puedes subirlo a la Raspberry Pi con: .\\subir_a_raspberry.bat"
+echo "✅ Compilación V2 completada con éxito."
+echo "   Archivo generado: models/sc2_v2_agent.hef"
+echo "   Sube a la RPi5 con: ./subir_a_raspberry_wsl.sh (o .\\subir_a_raspberry.bat)"
 echo "=========================================================="

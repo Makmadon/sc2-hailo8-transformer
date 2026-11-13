@@ -1,8 +1,8 @@
 @echo off
-title SC2 Hailo-8 Transformer Bot (Raspberry Pi 192.168.50.7:5555)
-cd /d "C:\Users\Stalin\.gemini\antigravity\scratch\sc2-hailo8-transformer"
+title SC2 Hailo-8 V2 Terran Bot (Raspberry Pi 192.168.50.7:5555)
+cd /d "%~dp0"
 echo ============================================================================
-echo   Iniciando StarCraft II en Mapa de Torneo (AbyssalReefLE) - Hailo-8 NPU
+echo   Iniciando StarCraft II Terran Bot V2 conectado a Raspberry Pi 5 (Hailo-8)
 echo ============================================================================
-py -3.12 -m src.pc_sc2_client --play --rpi-ip 192.168.50.7 --port 5555 --map AbyssalReefLE --race Terran --enemy-race Terran --difficulty Medium --realtime
+py -3.12 -m src.pc_sc2_client --play --rpi-ip 192.168.50.7 --port 5555 --map AbyssalReefLE --enemy-race Terran --difficulty Medium --realtime
 pause

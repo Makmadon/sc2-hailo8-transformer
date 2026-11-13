@@ -1,86 +1,135 @@
 """
-Configuración central del modelo SC2-Hailo8-Transformer y mapeo de acciones/estados.
-Diseñado específicamente para tensores 4D estáticos compatibles con Hailo-8 (26 TOPS INT8).
+Configuración central de SC2-Hailo8-Transformer V2 (Terran-First, Dual-Branch 32x32 + Global Vector).
+Diseñado para inferencia INT8 single-context en Hailo-8 (RPi 5) y entrenamiento CPU/GPU en WSL/Colab.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Set
 
-# Dimensiones espaciales y de entrada para Hailo-8 (Formato NCHW: [Batch=1, C=12, H=16, W=16])
-# 16x16 = 256 tokens espaciales/estado (ideal para atención estática en Hailo-8 sin desbordar SRAM)
-GRID_H: int = 16
-GRID_W: int = 16
-IN_CHANNELS: int = 12  # 6 canales espaciales (minimapa) + 6 canales de estado económico/temporal
+# Dimensiones estáticas NCHW para Hailo-8
+GRID_H: int = 32
+GRID_W: int = 32
+BOTTLENECK_H: int = 16
+BOTTLENECK_W: int = 16
+MAP_CHANNELS: int = 16
+GLOBAL_DIM: int = 64
+GLOBAL_TOKENS: int = 4
 
-# Horizonte de Action-Chunking (predice K=4 acciones futuras en un solo pase de inferencia)
-ACTION_CHUNK_SIZE: int = 4
-
-# Razas de StarCraft II
-RACES: Dict[str, int] = {
+# Razas enemigas codificadas en global_vec
+ENEMY_RACES: Dict[str, int] = {
     "Terran": 0,
     "Protoss": 1,
     "Zerg": 2,
     "Random": 3,
 }
 
-# Vocabulario unificado de 32 acciones macro y micro multi-raza (Terran / Protoss / Zerg)
-ACTION_VOCAB: List[str] = [
-    "NO_OP",                        # 0: Sin acción / esperar
-    "HARVEST_GATHER_MINERALS",      # 1: Enviar trabajadores a minerales
-    "HARVEST_GATHER_GAS",           # 2: Enviar trabajadores a refinería/asimilador/extractor
-    "TRAIN_WORKER",                 # 3: Entrenar SCV / Probe / Drone
-    "BUILD_SUPPLY",                 # 4: Supply Depot / Pylon / Overlord
-    "BUILD_GAS_EXTRACTOR",          # 5: Refinery / Assimilator / Extractor
-    "BUILD_EXPAND_BASE",            # 6: Command Center / Nexus / Hatchery
-    "BUILD_BARRACKS_GATEWAY_POOL",  # 7: Estructura básica de infantería (Barracks/Gateway/SpawningPool)
-    "BUILD_FACTORY_ROBO_ROACH",     # 8: Estructura mecanizada/media (Factory/Robotics/RoachWarren)
-    "BUILD_STARPORT_STARGATE_SPIRE",# 9: Estructura aérea (Starport/Stargate/Spire)
-    "BUILD_TECH_LAB_CORE_LAIR",     # 10: Estructura tecnológica (TechLab/CyberneticsCore/Lair/Hive)
-    "BUILD_DEFENSE_STRUCTURE",      # 11: Bunker / MissileTurret / PhotonCannon / SpineCrawler
-    "TRAIN_BASIC_INFANTRY",         # 12: Marine / Zealot / Zergling
-    "TRAIN_RANGED_CORE",            # 13: Marauder / Stalker / Roach / Hydralisk
-    "TRAIN_SPECIALIST_UNIT",        # 14: Reaper / Ghost / Sentry / HighTemplar / Baneling / Infestor
-    "TRAIN_SIEGE_HEAVY",            # 15: SiegeTank / Thor / Immortal / Colossus / Ultralisk / Lurker
-    "TRAIN_AIR_UNIT",               # 16: Medivac / Viking / Battlecruiser / VoidRay / Carrier / Mutalisk
-    "RESEARCH_COMBAT_UPGRADE",      # 17: Stimpack / CombatShield / Blink / Charge / ZerglingSpeed
-    "RESEARCH_WEAPONS_ARMOR",       # 18: Mejoras +1/+2/+3 de ataque y armadura en EngineeringBay/Forge/Evo
-    "MACRO_CHRONO_MULE_INJECT",     # 19: Habilidad macro de raza (Calldown MULE / ChronoBoost / SpawnLarva)
-    "MOVE_ARMY_POSITION",           # 20: Mover unidades a coordenada (x, y)
-    "MOVE_WORKER_SCOUT",            # 21: Mover trabajador a explorar coordenada (x, y)
-    "ATTACK_MOVE_COORDINATE",       # 22: Attack-Move (A-Move) hacia coordenada (x, y)
-    "FOCUS_FIRE_TARGET",            # 23: Concentrar fuego en unidad/estructura enemiga en (x, y)
-    "MICRO_KITE_RETREAT",           # 24: Retroceder unidades heridas / kite hacia (x, y)
-    "MICRO_USE_STIM_ABILITY",       # 25: Activar habilidad ofensiva (Stimpack / Blink / ForceField / RavagerBile)
-    "MICRO_SIEGE_TRANSFORM",        # 26: Siege/Unsiege Tank, Liberator, Burrow/Unburrow, Viking mode
-    "MICRO_HEAL_REPAIR_SHIELD",     # 27: Reparar con SCV / Medivac Heal / Shield Battery
-    "DEFEND_MAIN_NATURAL",          # 28: Reagrupar ejército en base principal o expansión natural
-    "HARASS_ENEMY_WORKERS",         # 29: Ataque rápido a línea de minerales enemiga en (x, y)
-    "RALLY_PRODUCTION",             # 30: Configurar punto de reunión de estructuras en (x, y)
-    "CANCEL_OR_HOLD_POSITION",      # 31: Hold position / Stop / Cancelar construcción en riesgo
+# ============================================================================
+# Vocabulario Dual Terran (Macro = 28 acciones, Micro = 12 acciones)
+# Ejecutados simultáneamente en cada tick (K=1, lazo cerrado) con Action Masking
+# ============================================================================
+
+MACRO_VOCAB: List[str] = [
+    "MACRO_NO_OP",                  # 0
+    "ASSIGN_MINERALS",              # 1
+    "ASSIGN_GAS",                   # 2
+    "TRAIN_SCV",                    # 3
+    "BUILD_SUPPLY_DEPOT",           # 4  [espacial]
+    "BUILD_REFINERY",               # 5  [espacial]
+    "BUILD_COMMAND_CENTER",         # 6  [espacial]
+    "BUILD_BARRACKS",               # 7  [espacial]
+    "BUILD_FACTORY",                # 8  [espacial]
+    "BUILD_STARPORT",               # 9  [espacial]
+    "BUILD_ENGINEERING_BAY",        # 10 [espacial]
+    "BUILD_ARMORY",                 # 11 [espacial]
+    "BUILD_BUNKER",                 # 12 [espacial]
+    "BUILD_MISSILE_TURRET",         # 13 [espacial]
+    "UPGRADE_ORBITAL_COMMAND",      # 14 [espacial: CC objetivo]
+    "BUILD_ADDON_TECHLAB",          # 15 [espacial: edificio producción]
+    "BUILD_ADDON_REACTOR",          # 16 [espacial: edificio producción]
+    "CALLDOWN_MULE",                # 17 [espacial: línea mineral]
+    "TRAIN_MARINE",                 # 18
+    "TRAIN_MARAUDER",               # 19
+    "TRAIN_REAPER",                 # 20
+    "TRAIN_HELLION",                # 21
+    "TRAIN_SIEGE_TANK",             # 22
+    "TRAIN_THOR_OR_CYCLONE",        # 23
+    "TRAIN_MEDIVAC",                # 24
+    "TRAIN_VIKING_OR_LIBERATOR",    # 25
+    "RESEARCH_BIO_TECH",            # 26 (Stimpack / Combat Shield / Concussive)
+    "RESEARCH_UPGRADES",            # 27 (+1/+2/+3 Armas y Armadura Bio/Mech)
 ]
 
-NUM_ACTIONS: int = len(ACTION_VOCAB)
-ACTION_TO_ID: Dict[str, int] = {name: idx for idx, name in enumerate(ACTION_VOCAB)}
-ID_TO_ACTION: Dict[int, str] = {idx: name for idx, name in enumerate(ACTION_VOCAB)}
+MICRO_VOCAB: List[str] = [
+    "MICRO_NO_OP",                  # 0
+    "SCOUT_WITH_SCV_OR_REAPER",     # 1  [espacial]
+    "SCANNER_SWEEP",                # 2  [espacial]
+    "MOVE_ARMY",                    # 3  [espacial]
+    "ATTACK_MOVE_ARMY",             # 4  [espacial]
+    "FOCUS_FIRE_AREA",              # 5  [espacial]
+    "KITE_RETREAT_ARMY",            # 6  [espacial]
+    "USE_STIMPACK",                 # 7
+    "SIEGE_TANKS_AT_AREA",          # 8  [espacial]
+    "UNSIEGE_TANKS_TO_MOVE",        # 9  [espacial]
+    "REPAIR_WITH_SCV",              # 10 [espacial]
+    "LOWER_OR_RAISE_DEPOTS",        # 11
+]
 
-# Dimensiones por cada paso del Action-Chunk:
-# [NUM_ACTIONS (32 logits) + GRID_W (16 logits X) + GRID_H (16 logits Y) + QUEUE_FLAG (2 logits)] = 66 valores por paso
-STEP_OUTPUT_DIM: int = NUM_ACTIONS + GRID_W + GRID_H + 2
+NUM_MACRO: int = len(MACRO_VOCAB)
+NUM_MICRO: int = len(MICRO_VOCAB)
+
+MACRO_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MACRO_VOCAB)}
+ID_TO_MACRO: Dict[int, str] = {i: name for i, name in enumerate(MACRO_VOCAB)}
+MICRO_TO_ID: Dict[str, int] = {name: i for i, name in enumerate(MICRO_VOCAB)}
+ID_TO_MICRO: Dict[int, str] = {i: name for i, name in enumerate(MICRO_VOCAB)}
+
+# Acciones que utilizan el heatmap espacial 32x32 correspondiente
+SPATIAL_MACRO_IDS: Set[int] = {4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17}
+SPATIAL_MICRO_IDS: Set[int] = {1, 2, 3, 4, 5, 6, 8, 9, 10}
+
+# Protocolo binario RPi5 <-> PC
+PROTOCOL_MAGIC: int = 0x53433256  # 'SC2V'
+PROTOCOL_VERSION: int = 2
+MAP_BYTES: int = 1 * MAP_CHANNELS * GRID_H * GRID_W * 4       # 65,536 bytes
+VEC_BYTES: int = 1 * GLOBAL_DIM * 1 * 1 * 4                   # 256 bytes
+REQ_BYTES: int = MAP_BYTES + VEC_BYTES                        # 65,792 bytes
+SPATIAL_CELLS: int = GRID_H * GRID_W                          # 1,024
 
 
 @dataclass
-class TrainingConfig:
-    batch_size: int = 64
-    learning_rate: float = 3e-4
-    weight_decay: float = 1e-4
-    epochs: int = 15
-    focal_gamma: float = 2.0
-    d_model: int = 128
+class V2Config:
+    d_model: int = 96
+    stem_channels: int = 48
     n_heads: int = 4
-    num_layers: int = 4
+    num_layers: int = 3
     mlp_ratio: int = 2
-    dropout: float = 0.1
+    dropout: float = 0.05
+
+    # Entrenamiento BC / PPO
+    batch_size: int = 64
+    bc_epochs: int = 20
+    bc_lr: float = 5e-4
+    rl_epochs: int = 6
+    rl_lr: float = 1e-4
+    weight_decay: float = 1e-4
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    ppo_clip: float = 0.20
+    kl_beta: float = 0.05
+    entropy_coef: float = 0.015
     onnx_opset: int = 16
-    calib_samples: int = 64
+    calib_samples: int = 128
+
+    # Red local RPi5
     lan_host: str = "0.0.0.0"
     lan_port: int = 5555
+
+    # Rutas relativas al repositorio (compatibles con Windows y WSL)
+    actor_weights: str = "models/sc2_v2_actor.pth"
+    bc_anchor_weights: str = "models/sc2_v2_bc_anchor.pth"
+    critic_weights: str = "models/sc2_v2_critic.pth"
+    onnx_path: str = "models/sc2_v2_actor.onnx"
+    hef_path: str = "models/sc2_v2_agent.hef"
+    har_path: str = "models/sc2_v2_quantized.har"
+    calib_path: str = "models/sc2_v2_calib.npz"
+    rollout_path: str = "models/sc2_v2_rollouts.npz"
+    bc_dataset_path: str = "data/sc2_v2_bc_dataset.npz"

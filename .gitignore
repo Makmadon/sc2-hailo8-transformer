@@ -8,12 +8,14 @@ __pycache__/
 venv/
 env/
 
-# Archivos temporales y logs locales
+# Archivos temporales, datasets y artefactos pesados locales
 *.log
 *.tmp
-models/rl_live_progress.log
-models/sc2_rl_rollouts.npz
+data/
+data_cache/
+models/*.npz
 models/*.har
+models/backup_*/
 
 # Archivos de sistema
 .DS_Store
